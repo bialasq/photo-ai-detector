@@ -31,6 +31,10 @@ dist/
 
 # Tauri / Rust
 src-tauri/target/
+src-tauri/binaries/photo-ai-engine-*
+dist-sidecar/
+build-sidecar/
+photo-ai-engine.spec
 
 # IDE / OS
 .idea/
