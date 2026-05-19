@@ -27,6 +27,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Final, Optional, Sequence, Union
 
+import cv2
 import numpy as np
 from sklearn.cluster import DBSCAN
 
@@ -37,6 +38,22 @@ from database import (
     PersonRow,
     ValidationError,
 )
+
+
+def _load_image_bgr(image_path: Path) -> np.ndarray:
+    """
+    Wczytuje obraz jako macierz NumPy (BGR) w sposób bezpieczny dla polskich znaków.
+    """
+    try:
+        # np.fromfile idealnie radzi sobie z polskimi znakami na Windows
+        img_array = np.fromfile(str(image_path), dtype=np.uint8)
+        img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError(f"Nie udało się zdekodować obrazu: {image_path}")
+        return img
+    except Exception as e:
+        raise ValueError(f"Błąd podczas ładowania pliku {image_path}: {str(e)}")
+
 
 # ---------------------------------------------------------------------------
 # Module logger
@@ -610,11 +627,13 @@ class AICoreEngine:
 
         return path
 
-    def _probe_detector_backend(self, image_path: Path) -> str:
+    def _probe_detector_backend(self, image: np.ndarray) -> str:
         """
-        Select RetinaFace when available; otherwise fall back to OpenCV.
+        Sprawdza i inicjalizuje backend detektora, przyjmując macierz numpy.
 
-        The probe runs a lightweight DeepFace.represent() call once per engine lifetime.
+        Wykonuje lekkie wywołanie ``DeepFace.represent()`` na przekazanym obrazie
+        (bez ścieżki pliku), aby probe nie wywalał się na polskich znakach w path.
+        Kolejno próbuje RetinaFace, potem OpenCV.
         """
         if self._active_detector_backend is not None:
             return self._active_detector_backend
@@ -625,8 +644,9 @@ class AICoreEngine:
         for backend in SUPPORTED_DETECTOR_BACKENDS:
             try:
                 LOGGER.info("Probing DeepFace detector backend '%s'...", backend)
+                # Macierz numpy zamiast ścieżki — bezpieczne dla UTF-8 / polskich znaków.
                 DeepFace.represent(
-                    img_path=str(image_path),
+                    img_path=image,
                     model_name=self.model_name,
                     detector_backend=backend,
                     enforce_detection=False,
@@ -638,44 +658,50 @@ class AICoreEngine:
             except Exception as exc:  # noqa: BLE001 — probe must catch all DeepFace/backend failures
                 last_error = exc
                 LOGGER.warning(
-                    "Detector backend '%s' unavailable: %s: %s",
+                    "Probe backendu '%s' nie powiódł się: %s: %s",
                     backend,
                     type(exc).__name__,
                     exc,
                 )
 
+        LOGGER.error("Probe backendu nie powiódł się (żaden backend): %s", last_error)
         raise FaceDetectionError(
             f"No usable detector backend among {SUPPORTED_DETECTOR_BACKENDS}. "
             f"Last error: {last_error}"
-        )
+        ) from last_error
 
-    def process_image(self, file_path: str) -> list[dict[str, Any]]:
+    def process_image(self, image_path: str | Path) -> list[dict[str, Any]]:
         """
-        Detect all faces in a local image and extract 512-d embeddings.
+        Przetwarza obraz, ekstrahuje wektory cech i wykrywa twarze.
+
+        Bezpieczny dla ścieżek z polskimi znakami: plik jest wczytywany raz
+        przez ``_load_image_bgr``, a macierz NumPy trafia do probe i DeepFace.
 
         Args:
-            file_path: Absolute or relative path to a raster image on disk.
+            image_path: Ścieżka do pliku graficznego (str lub Path).
 
         Returns:
-            List of JSON-ready dicts, each containing:
-              - embedding: list[float] length 512
-              - bounding_box: {"x": int, "y": int, "w": int, "h": int}
-              - detector_backend, model_name, confidence (metadata)
+            Lista słowników JSON-ready (embedding 512-d, bounding_box, metadane).
 
         Error handling:
-            - FileNotFoundError / ValueError propagate for invalid paths.
-            - On DeepFace failures: logs error and returns [] (pipeline-safe).
-            - When no faces are detected: returns [].
+            - FileNotFoundError / ValueError propagują (walidacja, uszkodzony plik).
+            - FaceDetectionError propaguje błąd probe backendu.
+            - Pozostałe błędy DeepFace: log + zwraca ``[]`` (bezpieczne dla pipeline).
         """
-        image_path = self._validate_image_path(file_path)
+        image_path = self._validate_image_path(str(image_path))
         LOGGER.info("Processing image: %s", image_path)
 
-        try:
-            detector_backend = self._probe_detector_backend(image_path)
-            DeepFace = self._get_deepface()
+        # 1. Wczytanie obrazu do macierzy numpy (jednorazowo)
+        img = _load_image_bgr(image_path)
 
+        try:
+            # 2. Probe backendu na gotowej macierzy
+            detector_backend = self._probe_detector_backend(img)
+
+            # 3. Reprezentacja DeepFace — tablica NumPy zamiast ścieżki
+            DeepFace = self._get_deepface()
             raw_result = DeepFace.represent(
-                img_path=str(image_path),
+                img_path=img,
                 model_name=self.model_name,
                 detector_backend=detector_backend,
                 enforce_detection=self.enforce_detection,
