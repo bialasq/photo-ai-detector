@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+*.spec
+
+# Local databases & runtime artifacts
+*.db
+*.db-wal
+*.db-shm
+organizer.db
+data/
+
+# AI / test artifacts
+_ai_core_smoke_test.db
+_ai_core_probe_face.jpg
+_organizer_smoke_test.db
+
+# Node / frontend
+node_modules/
+dist/
+.vite/
+
+# Tauri / Rust
+src-tauri/target/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+.env.*
+
+# Logs
+*.log
