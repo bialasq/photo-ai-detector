@@ -1,0 +1,9 @@
+[package]
+name = "photo-ai-backend-launcher"
+version = "1.0.0"
+edition = "2021"
+description = "Dev sidecar stub: runs python main.py and forwards stdout/stderr to Tauri"
+
+[[bin]]
+name = "photo-ai-backend"
+path = "src/main.rs"

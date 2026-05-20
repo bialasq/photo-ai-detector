@@ -1,11 +1,11 @@
-# Builds photo-ai-engine sidecar via PyInstaller and renames it for Tauri externalBin.
+# Builds photo-ai-backend sidecar via PyInstaller and renames it for Tauri externalBin.
 # Requires: Python venv with requirements.txt + pyinstaller installed.
 #
 # Usage (from repo root):
 #   npm run sidecar:package
 #
 # Output:
-#   src-tauri/binaries/photo-ai-engine-<target-triple>.exe  (Windows)
+#   src-tauri/binaries/photo-ai-backend-<target-triple>.exe  (Windows)
 
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path $PSScriptRoot -Parent)
@@ -21,7 +21,6 @@ function Get-TargetTriple {
 $triple = Get-TargetTriple
 $distDir = Join-Path $PWD "dist-sidecar"
 $buildDir = Join-Path $PWD "build-sidecar"
-$specName = "photo-ai-engine.spec"
 
 Write-Host "Building PyInstaller sidecar for triple: $triple"
 
@@ -43,7 +42,7 @@ if (Test-Path $buildDir) { Remove-Item -Recurse -Force $buildDir }
     --noconfirm `
     --clean `
     --onefile `
-    --name photo-ai-engine `
+    --name photo-ai-backend `
     --distpath $distDir `
     --workpath $buildDir `
     --specpath $PWD `
@@ -63,7 +62,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller build failed with exit code $LASTEXITCODE"
 }
 
-$builtExe = Join-Path $distDir "photo-ai-engine.exe"
+$builtExe = Join-Path $distDir "photo-ai-backend.exe"
 if (-not (Test-Path $builtExe)) {
     throw "Expected executable not found: $builtExe"
 }
@@ -72,7 +71,7 @@ $binariesDir = Join-Path $PWD "src-tauri\binaries"
 New-Item -ItemType Directory -Force -Path $binariesDir | Out-Null
 
 $extension = if ($IsWindows -or $env:OS -match "Windows") { ".exe" } else { "" }
-$destName = "photo-ai-engine-$triple$extension"
+$destName = "photo-ai-backend-$triple$extension"
 $destPath = Join-Path $binariesDir $destName
 
 Copy-Item -Force $builtExe $destPath

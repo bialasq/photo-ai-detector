@@ -1,14 +1,11 @@
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { MainLayout } from "@/components/MainLayout";
 
 const BACKEND_HEALTH_URL = "http://127.0.0.1:8000/health";
 const HEALTH_POLL_INTERVAL_MS = 250;
 const HEALTH_TIMEOUT_MS = 120_000;
 
-/**
- * Wait until the Python FastAPI sidecar responds on /health, then reveal the window.
- * Prevents white-flash: tauri.conf.json starts with visible: false.
- */
 async function waitForBackendReady(): Promise<void> {
   const deadline = Date.now() + HEALTH_TIMEOUT_MS;
 
@@ -33,9 +30,8 @@ async function waitForBackendReady(): Promise<void> {
 }
 
 export default function App(): JSX.Element {
-  const [status, setStatus] = useState<string>("Łączenie z silnikiem AI (sidecar)…");
-  const [backendOk, setBackendOk] = useState<boolean>(false);
-  const [error, setError] = useState<string | null>(null);
+  const [isBootstrapping, setIsBootstrapping] = useState<boolean>(true);
+  const [bootstrapError, setBootstrapError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -46,19 +42,17 @@ export default function App(): JSX.Element {
         if (cancelled) {
           return;
         }
-        setBackendOk(true);
-        setStatus("Backend gotowy. Ładowanie interfejsu…");
         await getCurrentWindow().show();
-        setStatus("Photo Organizer — offline");
+        setIsBootstrapping(false);
       } catch (bootError) {
         if (cancelled) {
           return;
         }
         const message =
           bootError instanceof Error ? bootError.message : String(bootError);
-        setError(message);
-        setStatus("Błąd uruchomienia backendu");
+        setBootstrapError(message);
         await getCurrentWindow().show();
+        setIsBootstrapping(false);
       }
     }
 
@@ -69,29 +63,27 @@ export default function App(): JSX.Element {
     };
   }, []);
 
-  return (
-    <div className="flex min-h-full flex-col items-center justify-center gap-6 p-8">
-      <header className="text-center">
-        <h1 className="text-3xl font-semibold tracking-tight text-white">
-          Photo Organizer
-        </h1>
-        <p className="mt-2 text-sm text-slate-400">100% offline · Tauri 2 + Python sidecar</p>
-      </header>
-
-      <main className="w-full max-w-lg rounded-xl border border-slate-800 bg-slate-900/80 p-6 shadow-xl">
-        <p
-          className={`text-center text-sm ${
-            error ? "text-red-400" : backendOk ? "text-emerald-400" : "text-amber-300"
-          }`}
-        >
-          {error ?? status}
+  if (isBootstrapping) {
+    return (
+      <div className="flex h-screen flex-col items-center justify-center gap-4 bg-slate-950 p-8">
+        <p className="text-sm font-medium text-slate-300">
+          Łączenie z silnikiem AI (sidecar)…
         </p>
-        {backendOk && (
-          <p className="mt-4 text-center text-xs text-slate-500">
-            API: http://127.0.0.1:8000 · Dokumentacja: /docs
-          </p>
-        )}
-      </main>
-    </div>
-  );
+        <div className="h-8 w-8 animate-spin rounded-full border-2 border-slate-600 border-t-sky-400" />
+      </div>
+    );
+  }
+
+  if (bootstrapError !== null) {
+    return (
+      <div className="flex h-screen flex-col items-center justify-center gap-4 bg-slate-950 p-8">
+        <p className="text-center text-sm font-medium text-red-400">
+          Błąd uruchomienia backendu
+        </p>
+        <p className="max-w-lg text-center text-xs text-slate-500">{bootstrapError}</p>
+      </div>
+    );
+  }
+
+  return <MainLayout />;
 }

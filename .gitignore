@@ -18,6 +18,7 @@ build/
 *.db-shm
 organizer.db
 data/
+.thumbnail_cache/
 
 # AI / test artifacts
 _ai_core_smoke_test.db
@@ -31,10 +32,11 @@ dist/
 
 # Tauri / Rust
 src-tauri/target/
-src-tauri/binaries/photo-ai-engine-*
+src-tauri/backend-launcher/target/
+src-tauri/binaries/photo-ai-backend-*
 dist-sidecar/
 build-sidecar/
-photo-ai-engine.spec
+photo-ai-backend.spec
 
 # IDE / OS
 .idea/

@@ -13,8 +13,9 @@ Pipeline overview:
   └──────────────────┘    └─────────────────────┘    └───────────┬──────────────┘
                                                                   │
                      ┌────────────────────────────────────────────┴──────────────┐
-                     │  DBSCAN → pending clusters → process_decision_queue()      │
-                     │  Cosine thresholds → auto-assign OR boundary manual queue    │
+                     │  DBSCAN → persist cluster_id >= 0 only; noise → NULL      │
+                     │  Cosine thresholds → auto-assign OR boundary manual queue │
+                     │  process_decision_queue() / assign_name_to_cluster()      │
                      └────────────────────────────────────────────────────────────┘
 """
 
@@ -27,7 +28,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Final, Optional, Sequence, Union
 
-import cv2
 import numpy as np
 from sklearn.cluster import DBSCAN
 
@@ -39,20 +39,69 @@ from database import (
     ValidationError,
 )
 
+# ---------------------------------------------------------------------------
+# Optional OpenCV — lazy import (smoke tests / clustering work without cv2)
+# ---------------------------------------------------------------------------
+
+_CV2_MODULE: Any = None
+_CV2_IMPORT_ERROR: Optional[BaseException] = None
+
+
+def _get_cv2() -> Any:
+    """
+    Return the OpenCV module, importing it on first use.
+
+    Raises:
+        FaceDetectionError: When opencv-python is not installed in the active environment.
+    """
+    global _CV2_MODULE, _CV2_IMPORT_ERROR
+
+    if _CV2_MODULE is not None:
+        return _CV2_MODULE
+
+    if _CV2_IMPORT_ERROR is not None:
+        raise FaceDetectionError(
+            "opencv-python is not installed. Activate the project virtual environment "
+            "and run: pip install -r requirements.txt"
+        ) from _CV2_IMPORT_ERROR
+
+    try:
+        import cv2 as cv2_module
+    except ModuleNotFoundError as exc:
+        _CV2_IMPORT_ERROR = exc
+        raise FaceDetectionError(
+            "opencv-python is not installed. Activate the project virtual environment "
+            "and run: pip install -r requirements.txt"
+        ) from exc
+
+    _CV2_MODULE = cv2_module
+    return _CV2_MODULE
+
+
+def cv2_available() -> bool:
+    """Return True when OpenCV can be imported in the current interpreter."""
+    try:
+        _get_cv2()
+        return True
+    except FaceDetectionError:
+        return False
+
 
 def _load_image_bgr(image_path: Path) -> np.ndarray:
     """
     Wczytuje obraz jako macierz NumPy (BGR) w sposób bezpieczny dla polskich znaków.
     """
+    cv2 = _get_cv2()
     try:
-        # np.fromfile idealnie radzi sobie z polskimi znakami na Windows
         img_array = np.fromfile(str(image_path), dtype=np.uint8)
         img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
         if img is None:
             raise ValueError(f"Nie udało się zdekodować obrazu: {image_path}")
         return img
-    except Exception as e:
-        raise ValueError(f"Błąd podczas ładowania pliku {image_path}: {str(e)}")
+    except FaceDetectionError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"Błąd podczas ładowania pliku {image_path}: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -65,13 +114,11 @@ LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 # DeepFace / model configuration
 # ---------------------------------------------------------------------------
 
-# Re-export for callers that import from ai_core only.
 EXPECTED_EMBEDDING_DIMENSION: Final[int] = EXPECTED_EMBEDDING_DIMENSION
 
 PRIMARY_DETECTOR_BACKEND: Final[str] = "retinaface"
 FALLBACK_DETECTOR_BACKEND: Final[str] = "opencv"
 
-# ArcFace produces 512-dimensional embeddings in DeepFace (Facenet512 is an alternative).
 PRIMARY_EMBEDDING_MODEL: Final[str] = "ArcFace"
 ALTERNATIVE_EMBEDDING_MODEL: Final[str] = "Facenet512"
 
@@ -88,32 +135,19 @@ SUPPORTED_EMBEDDING_MODELS: Final[tuple[str, ...]] = (
 # ---------------------------------------------------------------------------
 # Cosine distance thresholds (project specification)
 # ---------------------------------------------------------------------------
-#
-# Cosine distance:
-#   D_C(u, v) = 1 - (u · v) / (||u|| * ||v||)
-#
-# Interpretation:
-#   - Smaller D_C  → more similar faces
-#   - Larger D_C   → more different faces
-#
-# Rules:
-#   - D_C < 0.40           → automatic "same person" classification
-#   - 0.38 <= D_C <= 0.45  → boundary face → manual Yes/No verification queue
-#   - D_C > 0.45           → treat as different identity (remain unassigned / new cluster)
-# ---------------------------------------------------------------------------
 
 COSINE_DISTANCE_AUTO_SAME_PERSON_MAX: Final[float] = 0.40
 COSINE_DISTANCE_BOUNDARY_MIN: Final[float] = 0.38
 COSINE_DISTANCE_BOUNDARY_MAX: Final[float] = 0.45
 
-# DBSCAN hyper-parameters in cosine-distance space (metric='cosine' → same D_C formula).
 DBSCAN_EPS: Final[float] = COSINE_DISTANCE_AUTO_SAME_PERSON_MAX
 DBSCAN_MIN_SAMPLES: Final[int] = 2
 
-# Minimum file size in bytes to reject empty/corrupt placeholders early.
+# sklearn DBSCAN noise label — never written to faces.cluster_id (use NULL instead).
+DBSCAN_NOISE_LABEL: Final[int] = -1
+
 MIN_IMAGE_FILE_BYTES: Final[int] = 32
 
-# Allowed raster extensions for local ingestion.
 SUPPORTED_IMAGE_SUFFIXES: Final[frozenset[str]] = frozenset(
     {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 )
@@ -122,6 +156,7 @@ SUPPORTED_IMAGE_SUFFIXES: Final[frozenset[str]] = frozenset(
 # ---------------------------------------------------------------------------
 # Domain exceptions
 # ---------------------------------------------------------------------------
+
 
 class AICoreError(Exception):
     """Base exception for AI core failures."""
@@ -147,6 +182,7 @@ class ClusterNotFoundError(ClusteringError, LookupError):
 # Similarity classification (cosine distance decision logic)
 # ---------------------------------------------------------------------------
 
+
 class SimilarityClass(str, Enum):
     """
     Result of comparing two face embeddings via cosine distance.
@@ -164,6 +200,7 @@ class SimilarityClass(str, Enum):
 # ---------------------------------------------------------------------------
 # Structured result types
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True, slots=True)
 class DetectedFaceDict:
@@ -193,11 +230,10 @@ class DetectedFaceDict:
 @dataclass(frozen=True, slots=True)
 class PendingCluster:
     """
-    Temporary cluster produced by DBSCAN before the user assigns a name.
+    Temporary multi-face cluster produced by DBSCAN before the user assigns a name.
 
     Attributes:
-        cluster_id: Stable identifier within the current ClusteringEngine session
-                    (derived from DBSCAN label or synthetic singleton id).
+        cluster_id: DBSCAN label (0, 1, 2, …). Noise singletons never become pending clusters.
         face_ids: Database primary keys of member faces.
         representative_embedding: L2-normalized mean embedding (cluster prototype).
         face_rows: Full FaceRow objects for downstream UI display.
@@ -214,7 +250,7 @@ class BoundaryFaceRecord:
     """
     A face in the manual verification queue (twarz graniczna).
 
-  Shown to the user as: "Is this the same person as X? (Yes/No)" when
+    Shown to the user as: "Is this the same person as X? (Yes/No)" when
     COSINE_DISTANCE_BOUNDARY_MIN <= D_C <= COSINE_DISTANCE_BOUNDARY_MAX.
     """
 
@@ -227,21 +263,38 @@ class BoundaryFaceRecord:
     reference_embedding: list[float]
 
 
+@dataclass(frozen=True, slots=True)
+class DbscanResolution:
+    """
+    Result of mapping DBSCAN labels to database cluster assignments.
+
+    Attributes:
+        named_clusters: DBSCAN labels >= 0 mapped to member faces (persisted cluster_id).
+        noise_faces: Faces labeled -1 by DBSCAN; cluster_id cleared to NULL in SQLite.
+    """
+
+    named_clusters: dict[int, list[FaceRow]]
+    noise_faces: list[FaceRow]
+
+
 @dataclass
 class ClusteringRunResult:
     """Summary returned by `ClusteringEngine.run_incremental_clustering`."""
 
     total_unassigned_loaded: int = 0
+    clusters_persisted: int = 0
+    faces_cluster_ids_written: int = 0
+    noise_faces_discarded: int = 0
     clusters_created: int = 0
     auto_assigned_faces: int = 0
     boundary_faces_queued: int = 0
-    noise_faces_singled: int = 0
     pending_cluster_ids: list[int] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
 # Math helpers — cosine distance & vector utilities
 # ---------------------------------------------------------------------------
+
 
 def _as_float_vector(values: Sequence[float], *, name: str = "vector") -> np.ndarray:
     """
@@ -333,7 +386,6 @@ def cosine_distance(
 
     dot_product = float(np.dot(u, v))
     cosine_similarity = dot_product / (norm_u * norm_v)
-    # Numerical safety: keep inside valid range for arccos / threshold tests.
     cosine_similarity = float(np.clip(cosine_similarity, -1.0, 1.0))
     distance = 1.0 - cosine_similarity
 
@@ -424,6 +476,7 @@ def pairwise_cosine_distance_matrix(
 # DeepFace integration helpers
 # ---------------------------------------------------------------------------
 
+
 def _import_deepface() -> Any:
     """
     Import DeepFace lazily so module import succeeds in environments without TF.
@@ -458,7 +511,6 @@ def _extract_facial_area_as_bbox(facial_area: dict[str, Any]) -> dict[str, int]:
             "h": int(facial_area["h"]),
         }
 
-    # Some backends return x, y, w, h under nested keys.
     if all(key in facial_area for key in ("left", "top", "right", "bottom")):
         left = int(facial_area["left"])
         top = int(facial_area["top"])
@@ -542,6 +594,7 @@ def _parse_deepface_represent_result(
 # ---------------------------------------------------------------------------
 # Component 1 — face detection & embedding extraction
 # ---------------------------------------------------------------------------
+
 
 class AICoreEngine:
     """
@@ -644,7 +697,6 @@ class AICoreEngine:
         for backend in SUPPORTED_DETECTOR_BACKENDS:
             try:
                 LOGGER.info("Probing DeepFace detector backend '%s'...", backend)
-                # Macierz numpy zamiast ścieżki — bezpieczne dla UTF-8 / polskich znaków.
                 DeepFace.represent(
                     img_path=image,
                     model_name=self.model_name,
@@ -685,20 +737,17 @@ class AICoreEngine:
 
         Error handling:
             - FileNotFoundError / ValueError propagują (walidacja, uszkodzony plik).
-            - FaceDetectionError propaguje błąd probe backendu.
+            - FaceDetectionError propaguje błąd probe backendu / brak OpenCV.
             - Pozostałe błędy DeepFace: log + zwraca ``[]`` (bezpieczne dla pipeline).
         """
         image_path = self._validate_image_path(str(image_path))
         LOGGER.info("Processing image: %s", image_path)
 
-        # 1. Wczytanie obrazu do macierzy numpy (jednorazowo)
         img = _load_image_bgr(image_path)
 
         try:
-            # 2. Probe backendu na gotowej macierzy
             detector_backend = self._probe_detector_backend(img)
 
-            # 3. Reprezentacja DeepFace — tablica NumPy zamiast ścieżki
             DeepFace = self._get_deepface()
             raw_result = DeepFace.represent(
                 img_path=img,
@@ -746,6 +795,7 @@ class AICoreEngine:
 # Component 2 — incremental clustering & progressive learning
 # ---------------------------------------------------------------------------
 
+
 class ClusteringEngine:
     """
     Incremental clustering over unassigned faces stored in SQLite.
@@ -753,9 +803,11 @@ class ClusteringEngine:
     Workflow:
       1. `run_incremental_clustering()` loads faces where person_id IS NULL.
       2. DBSCAN groups faces in 512-d cosine space.
-      3. Known-person prototypes are compared for auto-assign vs boundary queue.
-      4. Unlabeled clusters are exposed via `pending_clusters` until the user names them.
-      5. `process_decision_queue()` persists a new person and bulk-assigns the cluster.
+      3. Named clusters (label >= 0) persist cluster_id via `update_faces_cluster_id()`.
+      4. Noise faces (label -1) get cluster_id cleared to NULL — excluded from UI lists.
+      5. Known-person prototypes are compared for auto-assign vs boundary queue.
+      6. Unlabeled multi-face clusters go to `pending_clusters` / `get_unnamed_clusters()`.
+      7. `process_decision_queue()` persists a new person and bulk-assigns the cluster.
     """
 
     def __init__(self, database: DatabaseManager) -> None:
@@ -766,7 +818,6 @@ class ClusteringEngine:
         self.database = database
         self._pending_clusters: dict[int, PendingCluster] = {}
         self._boundary_queue: list[BoundaryFaceRecord] = []
-        self._next_synthetic_cluster_id: int = 10_000
 
         LOGGER.info("ClusteringEngine bound to database %s", database.db_path)
 
@@ -786,11 +837,124 @@ class ClusteringEngine:
         self._boundary_queue.clear()
         LOGGER.debug("ClusteringEngine session state cleared")
 
-    def _allocate_synthetic_cluster_id(self) -> int:
-        """Return a unique cluster id for DBSCAN noise (-1) singleton groups."""
-        cluster_id = self._next_synthetic_cluster_id
-        self._next_synthetic_cluster_id += 1
-        return cluster_id
+    def _resolve_dbscan_labels(
+        self,
+        faces: list[FaceRow],
+        labels: np.ndarray,
+    ) -> DbscanResolution:
+        """
+        Map DBSCAN output labels to named clusters vs noise faces.
+
+        DBSCAN label -1 (noise) is **not** assigned a persistent cluster_id. Those faces
+        are returned separately so the caller can clear cluster_id in SQLite (NULL).
+
+        Args:
+            faces: Face rows aligned with DBSCAN input order.
+            labels: fit_predict output (same length as ``faces``).
+
+        Returns:
+            DbscanResolution with named_clusters (label 0, 1, 2, …) and noise_faces.
+        """
+        if len(faces) != len(labels):
+            raise ClusteringError(
+                f"face/label length mismatch: {len(faces)} faces vs {len(labels)} labels"
+            )
+
+        named_clusters: dict[int, list[FaceRow]] = {}
+        noise_faces: list[FaceRow] = []
+
+        for face, raw_label in zip(faces, labels):
+            label = int(raw_label)
+            if label == DBSCAN_NOISE_LABEL:
+                noise_faces.append(face)
+            elif label < 0:
+                LOGGER.warning(
+                    "Unexpected negative DBSCAN label %s for face id=%s — treating as noise",
+                    label,
+                    face.id,
+                )
+                noise_faces.append(face)
+            else:
+                named_clusters.setdefault(label, []).append(face)
+
+        return DbscanResolution(
+            named_clusters=named_clusters,
+            noise_faces=noise_faces,
+        )
+
+    def _persist_dbscan_cluster_labels(
+        self,
+        resolution: DbscanResolution,
+    ) -> tuple[int, int]:
+        """
+        Write DBSCAN results to SQLite.
+
+        Named clusters receive their DBSCAN label as cluster_id. Noise faces have
+        cluster_id cleared to NULL so `get_unnamed_clusters()` ignores them.
+
+        Args:
+            resolution: Output of `_resolve_dbscan_labels`.
+
+        Returns:
+            Tuple of (named_faces_written, noise_faces_cleared).
+
+        Raises:
+            ClusteringError: When any persistence call fails.
+        """
+        named_faces_written = 0
+
+        for cluster_id in sorted(resolution.named_clusters.keys()):
+            faces_in_group = resolution.named_clusters[cluster_id]
+            face_ids = [face.id for face in faces_in_group]
+            if not face_ids:
+                continue
+
+            try:
+                updated = self.database.update_faces_cluster_id(face_ids, cluster_id)
+            except Exception as exc:  # noqa: BLE001 — DB boundary
+                raise ClusteringError(
+                    f"Failed to persist cluster_id={cluster_id} for face_ids={face_ids}: {exc}"
+                ) from exc
+
+            if updated != len(face_ids):
+                LOGGER.warning(
+                    "cluster_id=%s: expected to update %s face(s), updated %s",
+                    cluster_id,
+                    len(face_ids),
+                    updated,
+                )
+
+            named_faces_written += updated
+            LOGGER.debug(
+                "Persisted cluster_id=%s for face_ids=%s (%s row(s))",
+                cluster_id,
+                face_ids,
+                updated,
+            )
+
+        noise_faces_cleared = 0
+        if resolution.noise_faces:
+            noise_face_ids = [face.id for face in resolution.noise_faces]
+            try:
+                noise_faces_cleared = self.database.clear_faces_cluster_id(noise_face_ids)
+            except Exception as exc:  # noqa: BLE001 — DB boundary
+                raise ClusteringError(
+                    f"Failed to clear cluster_id for noise face_ids={noise_face_ids}: {exc}"
+                ) from exc
+
+            LOGGER.info(
+                "Cleared cluster_id for %s DBSCAN noise face(s) (not exposed to unnamed API)",
+                noise_faces_cleared,
+            )
+
+        LOGGER.info(
+            "Persisted %s named-cluster face(s) across %s cluster(s); "
+            "cleared cluster_id on %s noise face(s)",
+            named_faces_written,
+            len(resolution.named_clusters),
+            noise_faces_cleared,
+        )
+        return named_faces_written, noise_faces_cleared
 
     def _build_person_prototypes(self) -> dict[int, dict[str, Any]]:
         """
@@ -893,10 +1057,11 @@ class ClusteringEngine:
         Steps:
           a) Load unassigned faces from DatabaseManager.
           b) Run DBSCAN(metric='cosine') in 512-dimensional embedding space.
-          c) For each cluster, compute a temporary representative embedding.
-          d) Attempt auto-assignment against known person prototypes.
-          e) Enqueue boundary faces for manual verification.
-          f) Store remaining clusters in `pending_clusters` for user naming.
+          c) Persist named cluster labels (>= 0); clear cluster_id for noise (-1).
+          d) For each named cluster, compute a representative embedding.
+          e) Attempt auto-assignment against known person prototypes.
+          f) Enqueue boundary faces for manual verification.
+          g) Store remaining named clusters in `pending_clusters` for user naming.
 
         Args:
             eps: DBSCAN neighborhood radius in cosine distance units.
@@ -958,14 +1123,32 @@ class ClusteringEngine:
             sorted(set(int(label) for label in labels)),
         )
 
-        label_to_faces: dict[int, list[FaceRow]] = {}
-        for face, label in zip(valid_faces, labels):
-            label_to_faces.setdefault(int(label), []).append(face)
+        resolution = self._resolve_dbscan_labels(valid_faces, labels)
+
+        try:
+            named_written, noise_cleared = self._persist_dbscan_cluster_labels(resolution)
+        except ClusteringError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — DB boundary
+            raise ClusteringError(
+                f"Failed to persist DBSCAN cluster_id labels: {exc}"
+            ) from exc
+
+        result.clusters_persisted = len(resolution.named_clusters)
+        result.faces_cluster_ids_written = named_written
+        result.noise_faces_discarded = len(resolution.noise_faces)
+        if resolution.noise_faces and noise_cleared != result.noise_faces_discarded:
+            LOGGER.warning(
+                "Expected to clear cluster_id on %s noise face(s), cleared %s",
+                result.noise_faces_discarded,
+                noise_cleared,
+            )
 
         prototypes = self._build_person_prototypes()
         self._pending_clusters.clear()
 
-        for label, faces_in_group in label_to_faces.items():
+        for cluster_id in sorted(resolution.named_clusters.keys()):
+            faces_in_group = resolution.named_clusters[cluster_id]
             if not faces_in_group:
                 continue
 
@@ -974,24 +1157,9 @@ class ClusteringEngine:
             try:
                 representative = compute_cluster_representative(member_embeddings)
             except EmbeddingError as exc:
-                LOGGER.warning("Skipping label %s: %s", label, exc)
+                LOGGER.warning("Skipping cluster_id %s: %s", cluster_id, exc)
                 continue
 
-            if label == -1:
-                # Noise → one singleton pending cluster per face (user can name individually).
-                for face in faces_in_group:
-                    cluster_id = self._allocate_synthetic_cluster_id()
-                    pending = PendingCluster(
-                        cluster_id=cluster_id,
-                        face_ids=[face.id],
-                        representative_embedding=l2_normalize(face.embedding),
-                        face_rows=[face],
-                    )
-                    self._pending_clusters[cluster_id] = pending
-                    result.noise_faces_singled += 1
-                continue
-
-            cluster_id = int(label)
             pending = PendingCluster(
                 cluster_id=cluster_id,
                 face_ids=[face.id for face in faces_in_group],
@@ -1027,11 +1195,11 @@ class ClusteringEngine:
             result.clusters_created += 1
 
         LOGGER.info(
-            "Clustering complete: pending=%s auto_assigned=%s boundary=%s noise_singletons=%s",
+            "Clustering complete: pending=%s auto_assigned=%s boundary=%s noise_discarded=%s",
             len(self._pending_clusters),
             result.auto_assigned_faces,
             result.boundary_faces_queued,
-            result.noise_faces_singled,
+            result.noise_faces_discarded,
         )
         return result
 
@@ -1060,13 +1228,13 @@ class ClusteringEngine:
         Persist user decision for a pending cluster (progressive learning step).
 
         When the user names a cluster representative (e.g. "Magda"):
-          1. Insert a new row into `people` with the supplied name / relationship.
+          1. Insert a new row into `people` with the supplied name.
           2. Bulk-update every face in the cluster with the new person_id.
 
         Args:
-            cluster_id: Identifier from `pending_clusters` (DBSCAN label or synthetic).
+            cluster_id: DBSCAN label from `pending_clusters` (must be >= 0).
             user_assigned_name: Display name entered by the user.
-            relationship: Optional relationship label (e.g. 'rodzina').
+            relationship: Deprecated ignored parameter kept for caller compatibility.
 
         Returns:
             Newly created `people.id`.
@@ -1146,7 +1314,10 @@ class ClusteringEngine:
             self._boundary_queue = [
                 record
                 for record in self._boundary_queue
-                if not (record.face_id == face_id and record.reference_person_id == reference_person_id)
+                if not (
+                    record.face_id == face_id
+                    and record.reference_person_id == reference_person_id
+                )
             ]
             return reference_person_id
 
@@ -1162,6 +1333,7 @@ class ClusteringEngine:
 # High-level orchestration helper (ingest one image end-to-end)
 # ---------------------------------------------------------------------------
 
+
 def ingest_image_to_database(
     *,
     ai_engine: AICoreEngine,
@@ -1176,6 +1348,21 @@ def ingest_image_to_database(
         Summary dict with photo_id, face_ids, and detection_count.
     """
     path = str(Path(file_path).expanduser().resolve())
+    existing_photo = database.get_photo_by_path(path)
+    if existing_photo is not None and existing_photo.processed:
+        LOGGER.info(
+            "Skipping ingestion for already processed photo id=%s path=%s",
+            existing_photo.id,
+            path,
+        )
+        return {
+            "photo_id": existing_photo.id,
+            "file_path": path,
+            "face_ids": [],
+            "detection_count": 0,
+            "skipped": True,
+        }
+
     photo_id = database.insert_photo(path)
 
     detections = ai_engine.process_image(path)
@@ -1198,12 +1385,14 @@ def ingest_image_to_database(
         "file_path": path,
         "face_ids": face_ids,
         "detection_count": len(face_ids),
+        "skipped": False,
     }
 
 
 # ---------------------------------------------------------------------------
 # Smoke test
 # ---------------------------------------------------------------------------
+
 
 def _build_synthetic_embedding(
     base_index: int,
@@ -1241,13 +1430,10 @@ def _run_smoke_test() -> None:
     """
     Verify cosine math, DBSCAN clustering flow, and optional DeepFace execution.
 
-    Uses a temporary SQLite database; does not require pre-existing project data.
+    Uses a temporary SQLite database; does not require OpenCV for the DBSCAN section.
     """
     print("=== ai_core.py smoke test ===")
 
-    # ------------------------------------------------------------------
-    # 1) Cosine distance mathematics
-    # ------------------------------------------------------------------
     vector_a = l2_normalize([1.0] + [0.0] * (EXPECTED_EMBEDDING_DIMENSION - 1))
     vector_b = l2_normalize([1.0] + [0.0] * (EXPECTED_EMBEDDING_DIMENSION - 1))
     vector_c = l2_normalize([0.0, 1.0] + [0.0] * (EXPECTED_EMBEDDING_DIMENSION - 2))
@@ -1265,9 +1451,6 @@ def _run_smoke_test() -> None:
 
     print("[OK] cosine distance + threshold classification")
 
-    # ------------------------------------------------------------------
-    # 2) DBSCAN + ClusteringEngine with synthetic DB rows
-    # ------------------------------------------------------------------
     test_db_path = "_ai_core_smoke_test.db"
     database = DatabaseManager(db_path=test_db_path)
 
@@ -1276,7 +1459,6 @@ def _run_smoke_test() -> None:
 
         photo_id = database.insert_photo(str(Path("synthetic_photo.jpg").resolve()))
 
-        # Three synthetic identity groups: (0,0), (1,1), (2) singleton/noise-like
         groups = [0, 0, 1, 1, 1, 2]
         face_ids: list[int] = []
         for idx, group in enumerate(groups):
@@ -1293,10 +1475,41 @@ def _run_smoke_test() -> None:
         run_result = clustering.run_incremental_clustering(eps=0.35, min_samples=2)
 
         assert run_result.total_unassigned_loaded == len(groups)
-        assert run_result.clusters_created + run_result.auto_assigned_faces + run_result.noise_faces_singled >= 1
+        assert run_result.noise_faces_discarded == 1
+        assert run_result.faces_cluster_ids_written == len(groups) - run_result.noise_faces_discarded
+        assert run_result.clusters_persisted == 2
+        assert run_result.clusters_created >= 1
+
+        noise_face_ids = [
+            face_id
+            for face_id in face_ids
+            if database.get_face_by_id(face_id) is not None
+            and database.get_face_by_id(face_id).cluster_id is None
+        ]
+        assert len(noise_face_ids) == 1
+
+        named_face_ids = [
+            face_id
+            for face_id in face_ids
+            if face_id not in noise_face_ids
+        ]
+        for face_id in named_face_ids:
+            persisted_face = database.get_face_by_id(face_id)
+            assert persisted_face is not None
+            assert persisted_face.cluster_id is not None
+            assert persisted_face.cluster_id >= 0
+
+        unnamed_in_db = database.get_unnamed_clusters()
+        assert all(cluster_id >= 0 for cluster_id in unnamed_in_db)
+        assert len(unnamed_in_db) >= len(clustering.pending_clusters)
+        assert len(unnamed_in_db) <= run_result.clusters_persisted
 
         if clustering.pending_clusters:
             cluster_id = next(iter(clustering.pending_clusters.keys()))
+            assert cluster_id >= 0
+            assert cluster_id in unnamed_in_db
+            db_cluster_faces = database.get_faces_for_cluster(cluster_id)
+            assert len(db_cluster_faces) >= 1
             person_id = clustering.process_decision_queue(
                 cluster_id=cluster_id,
                 user_assigned_name="Magda",
@@ -1308,10 +1521,11 @@ def _run_smoke_test() -> None:
 
         print(
             "[OK] DBSCAN incremental clustering "
-            f"(pending={len(clustering.pending_clusters)} auto={run_result.auto_assigned_faces})"
+            f"(pending={len(clustering.pending_clusters)} auto={run_result.auto_assigned_faces} "
+            f"named_faces={run_result.faces_cluster_ids_written} "
+            f"noise_discarded={run_result.noise_faces_discarded})"
         )
 
-        # Progressive learning: add known person and verify auto-match path
         database.insert_person("Anna", relationship="rodzina")
         anna_faces = database.get_faces_for_person(1)
         if anna_faces:
@@ -1333,9 +1547,14 @@ def _run_smoke_test() -> None:
         for suffix in ("-wal", "-shm"):
             Path(f"{test_db_path}{suffix}").unlink(missing_ok=True)
 
-    # ------------------------------------------------------------------
-    # 3) Optional live DeepFace probe (skipped gracefully if unavailable)
-    # ------------------------------------------------------------------
+    if cv2_available():
+        print("[OK] OpenCV (cv2) available in current interpreter")
+    else:
+        print(
+            "[SKIP] OpenCV (cv2) not installed — clustering tests passed; "
+            "activate venv and pip install -r requirements.txt for face detection"
+        )
+
     try:
         image_path = Path("_ai_core_probe_face.jpg")
         _create_synthetic_test_image(image_path)
@@ -1347,7 +1566,7 @@ def _run_smoke_test() -> None:
             f"backend={engine.active_detector_backend})"
         )
     except FaceDetectionError as exc:
-        print(f"[SKIP] DeepFace probe unavailable: {exc}")
+        print(f"[SKIP] DeepFace / OpenCV probe unavailable: {exc}")
     except Exception as exc:  # noqa: BLE001 — smoke test must not fail on missing TF weights
         print(f"[SKIP] DeepFace probe failed: {type(exc).__name__}: {exc}")
 
