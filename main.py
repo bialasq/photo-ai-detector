@@ -69,7 +69,20 @@ LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 # Server / security configuration
 # ---------------------------------------------------------------------------
 
-PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent
+def _resolve_project_root() -> Path:
+    """Repo root for caches and assets; honors PHOTO_AI_PROJECT_ROOT from Tauri sidecar."""
+    override = os.environ.get("PHOTO_AI_PROJECT_ROOT", "").strip()
+    if override:
+        root = Path(override).expanduser()
+        if not root.is_absolute():
+            root = (Path.cwd() / root).resolve()
+        else:
+            root = root.resolve()
+        return root
+    return Path(__file__).resolve().parent
+
+
+PROJECT_ROOT: Final[Path] = _resolve_project_root()
 DEFAULT_HOST: Final[str] = "127.0.0.1"
 DEFAULT_PORT: Final[int] = 8000
 DEFAULT_DATABASE_PATH: Final[str] = "organizer.db"

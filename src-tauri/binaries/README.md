@@ -1,8 +1,16 @@
 # Sidecar binaries (`photo-ai-backend`)
 
-Tauri bundles executables listed in `tauri.conf.json` → `bundle.externalBin`.
+Registered in **`tauri.conf.json`** → `bundle.externalBin`:
 
-For `binaries/photo-ai-backend`, place **one file per target triple**:
+```json
+"externalBin": ["binaries/photo-ai-backend"]
+```
+
+Tauri copies the host-specific file into the app bundle and exposes it to Rust as `app.shell().sidecar("photo-ai-backend")`.
+
+## Required filenames
+
+Place **one executable per target triple** in this directory:
 
 | Platform | Example filename |
 |----------|------------------|
@@ -17,18 +25,22 @@ Discover your triple:
 rustc --print host-tuple
 ```
 
-## Production (PyInstaller)
+## Build (PyInstaller)
+
+From the repo root:
 
 ```bash
 npm run sidecar:package
 ```
 
-This overwrites the dev launcher with a self-contained FastAPI binary.
+Output is copied to `photo-ai-backend-<triple>.exe` in this folder.
 
-## Development
+## Runtime behavior (`src-tauri/src/lib.rs`)
 
-If the triple-named file is missing, `src-tauri/build.rs` automatically builds a small Rust **launcher** (`backend-launcher/`) that runs `python main.py` and forwards logs to the Tauri console.
+| Scenario | Backend |
+|----------|---------|
+| **Release / packaged app** | Auto-spawns bundled sidecar on startup; `kill()` on window close / app exit |
+| **`PHOTO_ORGANIZER_EXTERNAL_BACKEND=1`** | No spawn (e.g. `run_app.bat` with separate uvicorn window) |
+| **Dev without PyInstaller binary** | `build.rs` may build a Rust launcher stub, or Rust falls back to `venv\Scripts\python.exe main.py` |
 
-Do **not** run `python main.py` manually while using `npm run tauri:dev` — only one process should bind port **8000**.
-
-The sidecar listens on `http://127.0.0.1:8000` (`PHOTO_ORGANIZER_HOST` / `PHOTO_ORGANIZER_PORT`).
+The sidecar listens on `http://127.0.0.1:8000` (`PHOTO_ORGANIZER_HOST` / `PHOTO_ORGANIZER_PORT`). In release, the working directory is the app data folder so `organizer.db` is stored beside the installed app.
