@@ -1,6 +1,10 @@
 # Photo AI Detector / Photo Organizer
 
+[![Repository](https://img.shields.io/badge/GitHub-bialasq%2Fphoto--ai--detector-181717?logo=github)](https://github.com/bialasq/photo-ai-detector)
+
 **100% offline desktop photo organizer** with face detection, 512-dimensional embeddings, incremental DBSCAN clustering, and a Tauri 2 + React UI. All inference and storage run on your machine — no cloud APIs, no accounts.
+
+> **Repository:** https://github.com/bialasq/photo-ai-detector
 
 | Property | Value |
 |----------|--------|
@@ -40,12 +44,14 @@ The project is a **monorepo at the repository root**: Python modules (`main.py`,
 
 ## Features
 
-- **Folder scan** — recursive ingestion with background progress (`phase`: `idle` → `scanning` → `clustering`).
-- **Face pipeline** — DeepFace (RetinaFace / OpenCV detectors, ArcFace embeddings), cosine similarity thresholds, incremental DBSCAN.
-- **People Profiles** — unnamed clusters, noise faces (`cluster_id` NULL or negative), merge duplicate people, assign names via `POST /api/clusters/identify`.
-- **Gallery** — grid with person filters (intersection), AI status filter (`all` / `processed` / `unprocessed`).
+- **Folder scan** — recursive ingestion with background progress (`phase`: `idle` → `scanning` → `clustering`). Optional cap via `PHOTO_ORGANIZER_MAX_SCAN_FILES` (default 20,000); skips system directories and drive roots.
+- **Face pipeline** — DeepFace (RetinaFace / OpenCV detectors, ArcFace embeddings), cosine similarity thresholds, incremental DBSCAN. Each face stores a pixel bounding box `{x, y, w, h}` in SQLite.
+- **People Profiles** — unnamed clusters with **face-cropped avatars** (server-side crop from bounding boxes), noise faces (`cluster_id` NULL), merge duplicate people, assign names via `POST /api/clusters/identify`.
+- **Gallery** — grid with multi-person intersection filters and AI status: `all` / `processed` / `unprocessed` / **`faceless`** (processed photos with zero detected faces — landscapes, architecture, etc.).
+- **Group photos** — one photo can contain many faces; filter by person without losing group shots. `GET /api/clusters/{id}/photos` lists every photo that contains a given cluster.
 - **Search** — comma-separated person names (AND / intersection).
-- **Thumbnails** — on-demand resized JPEGs for photos, clusters, people, and individual faces.
+- **Thumbnails** — on-demand JPEGs for full photos, clusters, people, and **face-centered crops** (`GET /api/faces/{id}/thumbnail?crop=1`).
+- **Faceless ingestion** — images with no faces are marked `processed=1` and `has_faces=0` so they are not rescanned indefinitely.
 - **Dev helpers** — optional simulate-scan and reset-library endpoints for local testing.
 
 ---
@@ -88,8 +94,9 @@ This section documents how the application was built — useful for onboarding a
 
 ### Phase 1 — Persistence & domain model (`database.py`)
 
-- Designed SQLite schema: `photos`, `faces`, `people`, embeddings as BLOBs, `cluster_id` / `person_id` linkage.
-- Implemented `DatabaseManager` with validation, migrations-style helpers, gallery/search queries, noise-face queries, and merge semantics.
+- Designed SQLite schema: `photos` (1) → (N) `faces`, `people`, embeddings as BLOBs, `bounding_box` JSON per face, `cluster_id` / `person_id` linkage.
+- `photos.has_faces` flag distinguishes processed images with no detections (faceless) from pending work.
+- Implemented `DatabaseManager` with validation, migrations-style helpers, gallery/search queries, noise-face queries, exemplar-face summaries for UI crops, and merge semantics.
 - Local DB path: **`organizer.db`** at project root (gitignored).
 
 ### Phase 2 — Offline AI core (`ai_core.py`)
@@ -247,17 +254,18 @@ Base URL: **`http://127.0.0.1:8000`**. The React client is implemented in `src/s
 | `GET` | `/health` | Liveness (`{ "status": "ok" }`) |
 | `POST` | `/api/scan-folder` | Start background folder ingestion |
 | `GET` | `/api/scan-status` | Poll `processed`, `total`, `is_active`, `phase`, `current_file`, `last_error` |
-| `GET` | `/api/gallery` | Gallery list (`person_ids`, `ai_status`) |
+| `GET` | `/api/gallery` | Gallery list (`person_ids`, `ai_status` = `all` \| `processed` \| `unprocessed` \| `faceless`) |
 | `GET` | `/api/search` | Intersection search by comma-separated names |
-| `GET` | `/api/people` | Named people summaries |
+| `GET` | `/api/people` | People summaries with `exemplar_face_id` and `bounding_box` for UI crops |
 | `POST` | `/api/people/merge` | Merge source person into target |
-| `GET` | `/api/clusters/unnamed` | Unnamed cluster IDs |
-| `GET` | `/api/clusters/noise` | Noise / unclustered faces |
+| `GET` | `/api/clusters/unnamed` | Unnamed cluster summaries (exemplar face, bbox, `thumbnail_url`) |
+| `GET` | `/api/clusters/{id}/photos` | All photos containing any face in the cluster (group shots included) |
+| `GET` | `/api/clusters/noise` | DBSCAN noise faces with bbox and crop thumbnail URLs |
 | `POST` | `/api/clusters/identify` | Name cluster or assign noise face (new or existing person) |
 | `GET` | `/api/photos/{id}/thumbnail` | Resized photo thumbnail |
 | `GET` | `/api/photos/{id}/file` | Full image bytes |
-| `GET` | `/api/clusters/{id}/thumbnail` | Cluster representative thumbnail |
-| `GET` | `/api/faces/{id}/thumbnail` | Single face crop thumbnail |
+| `GET` | `/api/clusters/{id}/thumbnail` | Cluster representative thumbnail (full frame) |
+| `GET` | `/api/faces/{id}/thumbnail` | Face thumbnail; add `?crop=1` for bbox-centered crop |
 | `GET` | `/api/people/{id}/thumbnail` | Person avatar thumbnail |
 | `POST` | `/api/dev/reset-library` | Clear ingestion data (dev) |
 | `POST` | `/api/dev/simulate-scan` | Scan a test folder (dev) |
@@ -290,6 +298,7 @@ Packaged binaries matching `photo-ai-backend-*` are **gitignored**; only sources
 | `PHOTO_AI_PROJECT_ROOT` | Sidecar | Project root for `python main.py` fallback |
 | `PHOTO_AI_PYTHON` | `package-sidecar.ps1` | Override Python executable for PyInstaller |
 | `TF_ENABLE_ONEDNN_OPTS=0` | TensorFlow | Optional: disable oneDNN info messages |
+| `PHOTO_ORGANIZER_MAX_SCAN_FILES` | Scan pipeline | Max image files per folder scan (default `20000`) |
 
 ---
 
@@ -370,12 +379,14 @@ Projekt to **monorepo w katalogu głównym**: moduły Pythona (`main.py`, `ai_co
 
 ## Funkcje
 
-- **Skan folderów** — rekurencyjna ingesta z postępem w tle (`phase`: `idle` → `scanning` → `clustering`).
-- **Pipeline twarzy** — DeepFace (RetinaFace / OpenCV, embeddingi ArcFace), progi cosinusowe, inkrementalny DBSCAN.
-- **People Profiles** — bezimienne klastry, twarze noise, scalanie osób, nadawanie imion przez `POST /api/clusters/identify`.
-- **Galeria** — siatka z filtrami osób (przecięcie AND) i filtrem AI (`all` / `processed` / `unprocessed`).
+- **Skan folderów** — rekurencyjna ingesta z postępem w tle; limit `PHOTO_ORGANIZER_MAX_SCAN_FILES`, pomijanie katalogów systemowych.
+- **Pipeline twarzy** — DeepFace, embeddingi ArcFace, DBSCAN; bbox `{x, y, w, h}` w bazie dla każdej twarzy.
+- **People Profiles** — miniatury z kadrowaniem twarzy, klastry bezimienne, twarze noise, scalanie osób.
+- **Galeria** — filtry osób (AND) i status AI, w tym **`faceless`** (zdjęcia bez twarzy).
+- **Zdjęcia grupowe** — relacja 1 zdjęcie → N twarzy; `GET /api/clusters/{id}/photos`.
 - **Wyszukiwanie** — lista imion rozdzielona przecinkami (przecięcie).
-- **Miniatury** — skalowane JPEG dla zdjęć, klastrów, osób i pojedynczych twarzy.
+- **Miniatury** — JPEG z opcją `?crop=1` dla twarzy.
+- **Zdjęcia bez twarzy** — `has_faces=0`, bez ponownego skanowania w pętli.
 - **Narzędzia dev** — opcjonalny simulate-scan i reset biblioteki.
 
 ---
@@ -506,11 +517,12 @@ Bazowy URL: **`http://127.0.0.1:8000`**. Klient: `src/services/api.ts`.
 | `GET` | `/health` | Sprawdzenie żywotności |
 | `POST` | `/api/scan-folder` | Start skanu folderu |
 | `GET` | `/api/scan-status` | Postęp skanu |
-| `GET` | `/api/gallery` | Galeria (`person_ids`, `ai_status`) |
+| `GET` | `/api/gallery` | Galeria (`person_ids`, `ai_status` + `faceless`) |
 | `GET` | `/api/search` | Wyszukiwanie po imionach (AND) |
-| `GET` | `/api/people` | Lista osób |
+| `GET` | `/api/people` | Lista osób (z bbox exemplar) |
 | `POST` | `/api/people/merge` | Scalanie profili |
-| `GET` | `/api/clusters/unnamed` | Bezimienne klastry |
+| `GET` | `/api/clusters/unnamed` | Podsumowania klastrów z bbox i URL miniatury |
+| `GET` | `/api/clusters/{id}/photos` | Zdjęcia danego klastra |
 | `GET` | `/api/clusters/noise` | Twarze noise |
 | `POST` | `/api/clusters/identify` | Nadanie imienia klastrowi / twarzy |
 | `GET` | `/api/photos/{id}/thumbnail` | Miniatura zdjęcia |

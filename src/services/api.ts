@@ -10,6 +10,7 @@ import type {
   ScanPhase,
   ScanStatusResponse,
   SearchResultItem,
+  UnnamedClusterSummaryItem,
 } from "@/types/api";
 
 function normalizeScanStatus(raw: ScanStatusResponse): ScanStatusResponse {
@@ -174,8 +175,12 @@ export async function getScanStatus(): Promise<ScanStatusResponse> {
   return normalizeScanStatus(raw);
 }
 
-export async function getUnnamedClusters(): Promise<number[]> {
-  return requestJson<number[]>("/api/clusters/unnamed");
+export async function getUnnamedClusters(): Promise<UnnamedClusterSummaryItem[]> {
+  return requestJson<UnnamedClusterSummaryItem[]>("/api/clusters/unnamed");
+}
+
+export async function getClusterPhotos(clusterId: number): Promise<SearchResultItem[]> {
+  return requestJson<SearchResultItem[]>(`/api/clusters/${clusterId}/photos`);
 }
 
 /**
@@ -314,6 +319,29 @@ export function getThumbnailUrl(photoId: number, width?: number): string {
 export function getClusterThumbnailUrl(clusterId: number, width?: number): string {
   const thumbnailWidth = width ?? 300;
   return `${BASE_URL}/api/clusters/${clusterId}/thumbnail?width=${thumbnailWidth}`;
+}
+
+export function getFaceCropThumbnailUrl(faceId: number, width?: number): string {
+  const thumbnailWidth = width ?? 128;
+  return `${BASE_URL}/api/faces/${faceId}/thumbnail?crop=1&width=${thumbnailWidth}`;
+}
+
+export function resolvePersonThumbnailUrl(
+  person: PersonSummaryItem,
+  width?: number,
+): string {
+  if (person.exemplar_face_id !== null) {
+    return getFaceCropThumbnailUrl(person.exemplar_face_id, width);
+  }
+  return getPersonThumbnailUrl(person.id, width);
+}
+
+/** Turn a relative API thumbnail path into a full URL for `<img src>`. */
+export function resolveApiThumbnailUrl(path: string): string {
+  if (path.startsWith("http")) {
+    return path;
+  }
+  return `${BASE_URL}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
 export function getPersonThumbnailUrl(personId: number, width?: number): string {

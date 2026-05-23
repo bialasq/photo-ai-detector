@@ -32,7 +32,7 @@ REM --- 2. Launch FastAPI backend in a dedicated console -----------------------
 REM     PYTHONNOUSERSITE=1 blocks global user-site packages (e.g. AppData).
 echo.
 echo [1/4] Starting backend in "Photo Organizer - Backend" ...
-start "Photo Organizer - Backend" cmd /k "cd /d ""!PROJECT_ROOT!"" && call .\venv\Scripts\activate.bat && set PYTHONNOUSERSITE=1 && python -m uvicorn main:app --host 127.0.0.1 --port 8000 --log-level info"
+start "Photo Organizer - Backend" cmd /k "cd /d ""!PROJECT_ROOT!"" && call .\venv\Scripts\activate.bat && set PYTHONNOUSERSITE=1 && set TF_ENABLE_ONEDNN_OPTS=0 && python -m uvicorn main:app --host 127.0.0.1 --port 8000 --log-level info"
 
 REM --- 3. Allow models and Uvicorn to initialize -------------------------------
 echo [2/4] Waiting 5 seconds for backend initialization...
@@ -60,7 +60,7 @@ REM Close the titled backend console window.
 taskkill /FI "WINDOWTITLE eq Photo Organizer - Backend*" /F >nul 2>&1
 
 REM Safety net: terminate any process still listening on port 8000.
-for /f "tokens=5" %%P in ('netstat -ano ^| findstr ":8000" ^| findstr "LISTENING"') do (
+for /f "tokens=5" %%P in ('netstat -ano ^| findstr /C:"127.0.0.1:8000" ^| findstr /C:"LISTENING"') do (
     if not "%%P"=="0" (
         taskkill /PID %%P /F >nul 2>&1
     )

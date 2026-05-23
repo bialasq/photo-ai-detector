@@ -6,9 +6,14 @@ import {
   type FocusEvent,
   type KeyboardEvent,
 } from "react";
-import { CheckCircle, ImageOff, Loader2, RefreshCw, User } from "lucide-react";
+import { CheckCircle, Loader2, RefreshCw, User } from "lucide-react";
+import { FaceCropImage } from "@/components/FaceCropImage";
 import * as api from "@/services/api";
-import type { IdentifyClusterResponse, PersonSummaryItem } from "@/types/api";
+import type {
+  IdentifyClusterResponse,
+  PersonSummaryItem,
+  UnnamedClusterSummaryItem,
+} from "@/types/api";
 
 export type PeopleGridMode = "manage" | "filter";
 
@@ -59,6 +64,8 @@ function upsertNamedPerson(
       name: response.name,
       face_count: 0,
       exemplar_photo_path: null,
+      exemplar_face_id: null,
+      bounding_box: null,
     },
   ];
 }
@@ -75,7 +82,7 @@ interface PeopleGridProps {
 }
 
 interface UnnamedClusterCardProps {
-  clusterId: UnnamedClusterId;
+  summary: UnnamedClusterSummaryItem;
   nameValue: string;
   inputState: InputFocusState;
   errorMessage: string | null;
@@ -85,7 +92,7 @@ interface UnnamedClusterCardProps {
 }
 
 function UnnamedClusterCard({
-  clusterId,
+  summary,
   nameValue,
   inputState,
   errorMessage,
@@ -93,13 +100,9 @@ function UnnamedClusterCard({
   onNameChange,
   onCommitName,
 }: UnnamedClusterCardProps): JSX.Element {
-  const [imageLoadFailed, setImageLoadFailed] = useState<boolean>(false);
+  const clusterId = summary.cluster_id;
   const trimmedName = nameValue.trim();
-  const thumbnailUrl = api.getClusterThumbnailUrl(clusterId, 128);
-
-  useEffect(() => {
-    setImageLoadFailed(false);
-  }, [clusterId]);
+  const thumbnailUrl = api.resolveApiThumbnailUrl(summary.thumbnail_url);
 
   const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>): void => {
     if (event.key === "Enter") {
@@ -136,18 +139,10 @@ function UnnamedClusterCard({
     >
       <article className="flex h-full flex-col items-center gap-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
         <div className="relative h-20 w-20 shrink-0 overflow-hidden rounded-full border-2 border-slate-100 bg-slate-50 shadow-inner">
-          {!imageLoadFailed ? (
-            <img
-              src={thumbnailUrl}
-              alt={`Unnamed cluster ${clusterId}`}
-              className="h-full w-full object-cover"
-              onError={() => setImageLoadFailed(true)}
-            />
-          ) : (
-            <div className="flex h-full w-full items-center justify-center text-slate-400">
-              <ImageOff className="h-6 w-6" aria-hidden="true" />
-            </div>
-          )}
+          <FaceCropImage
+            thumbnailUrl={thumbnailUrl}
+            alt={`Unnamed cluster ${clusterId}`}
+          />
         </div>
 
         <div className="w-full flex-1 space-y-1.5 text-center">
@@ -199,13 +194,8 @@ function NamedPersonFilterChip({
   disabled,
   onToggle,
 }: NamedPersonFilterChipProps): JSX.Element {
-  const [imageLoadFailed, setImageLoadFailed] = useState<boolean>(false);
   const label = personDisplayName(person);
-  const thumbnailUrl = api.getPersonThumbnailUrl(person.id, 96);
-
-  useEffect(() => {
-    setImageLoadFailed(false);
-  }, [person.id]);
+  const thumbnailUrl = api.resolvePersonThumbnailUrl(person, 96);
 
   return (
     <button
@@ -225,13 +215,8 @@ function NamedPersonFilterChip({
             : "border-slate-200 group-hover:border-sky-300"
         }`}
       >
-        {!imageLoadFailed ? (
-          <img
-            src={thumbnailUrl}
-            alt=""
-            className="h-full w-full object-cover"
-            onError={() => setImageLoadFailed(true)}
-          />
+        {person.exemplar_face_id !== null ? (
+          <FaceCropImage thumbnailUrl={thumbnailUrl} alt="" />
         ) : (
           <User className="h-6 w-6 text-slate-400" aria-hidden="true" />
         )}
@@ -263,15 +248,10 @@ function NamedPersonManageCard({
   selectionDisabled = false,
   onToggleSelect,
 }: NamedPersonManageCardProps): JSX.Element {
-  const [imageLoadFailed, setImageLoadFailed] = useState<boolean>(false);
   const label = personDisplayName(person);
   const faceLabel =
     person.face_count === 1 ? "1 face" : `${person.face_count} faces`;
-  const thumbnailUrl = api.getPersonThumbnailUrl(person.id, 128);
-
-  useEffect(() => {
-    setImageLoadFailed(false);
-  }, [person.id]);
+  const thumbnailUrl = api.resolvePersonThumbnailUrl(person, 128);
 
   const selectable = onToggleSelect !== undefined;
 
@@ -310,13 +290,8 @@ function NamedPersonManageCard({
         }`}
       >
         <div className="relative h-20 w-20 shrink-0 overflow-hidden rounded-full border-2 border-emerald-100 bg-slate-50">
-          {!imageLoadFailed ? (
-            <img
-              src={thumbnailUrl}
-              alt={`${label} avatar`}
-              className="h-full w-full object-cover"
-              onError={() => setImageLoadFailed(true)}
-            />
+          {person.exemplar_face_id !== null ? (
+            <FaceCropImage thumbnailUrl={thumbnailUrl} alt={`${label} avatar`} />
           ) : (
             <div className="flex h-full w-full items-center justify-center text-slate-400">
               <User className="h-6 w-6" aria-hidden="true" />
@@ -382,7 +357,9 @@ export function PeopleGrid({
   className = "",
 }: PeopleGridProps): JSX.Element {
   const [people, setPeople] = useState<PersonSummaryItem[]>([]);
-  const [unnamedClusterIds, setUnnamedClusterIds] = useState<UnnamedClusterId[]>([]);
+  const [unnamedClusters, setUnnamedClusters] = useState<UnnamedClusterSummaryItem[]>(
+    [],
+  );
   const [exitingClusterIds, setExitingClusterIds] = useState<UnnamedClusterId[]>([]);
   const [enteringPersonIds, setEnteringPersonIds] = useState<number[]>([]);
   const [namesInput, setNamesInput] = useState<ClusterNamesInput>({});
@@ -397,6 +374,9 @@ export function PeopleGrid({
 
   const fetchGenerationRef = useRef<number>(0);
   const exitTimersRef = useRef<Map<UnnamedClusterId, ReturnType<typeof setTimeout>>>(
+    new Map(),
+  );
+  const clusterSummaryCacheRef = useRef<Map<UnnamedClusterId, UnnamedClusterSummaryItem>>(
     new Map(),
   );
 
@@ -419,9 +399,11 @@ export function PeopleGrid({
     try {
       const peoplePromise = api.getPeople();
       const clustersPromise =
-        mode === "manage" ? api.getUnnamedClusters() : Promise.resolve([] as number[]);
+        mode === "manage"
+          ? api.getUnnamedClusters()
+          : Promise.resolve([] as UnnamedClusterSummaryItem[]);
 
-      const [peopleRows, clusterIds] = await Promise.all([
+      const [peopleRows, clusterSummaries] = await Promise.all([
         peoplePromise,
         clustersPromise,
       ]);
@@ -432,7 +414,10 @@ export function PeopleGrid({
 
       setPeople(peopleRows);
       notifyPeopleUpdated(peopleRows);
-      setUnnamedClusterIds(clusterIds);
+      setUnnamedClusters(clusterSummaries);
+      clusterSummaryCacheRef.current = new Map(
+        clusterSummaries.map((summary) => [summary.cluster_id, summary]),
+      );
       setExitingClusterIds([]);
       setEnteringPersonIds([]);
 
@@ -440,7 +425,8 @@ export function PeopleGrid({
       const initialStates: Record<UnnamedClusterId, InputFocusState> = {};
       const initialErrors: Record<UnnamedClusterId, string | null> = {};
 
-      for (const clusterId of clusterIds) {
+      for (const summary of clusterSummaries) {
+        const clusterId = summary.cluster_id;
         initialNames[clusterId] = "";
         initialStates[clusterId] = "idle";
         initialErrors[clusterId] = null;
@@ -457,7 +443,7 @@ export function PeopleGrid({
 
       setError(api.getApiErrorMessage(fetchError));
       setPeople([]);
-      setUnnamedClusterIds([]);
+      setUnnamedClusters([]);
       setIsLoading(false);
     }
   }, [mode, notifyPeopleUpdated]);
@@ -491,9 +477,10 @@ export function PeopleGrid({
 
   const finalizeClusterPromotion = useCallback(
     async (clusterId: UnnamedClusterId, response: IdentifyClusterResponse) => {
-      setUnnamedClusterIds((previous) =>
-        previous.filter((id) => id !== clusterId),
+      setUnnamedClusters((previous) =>
+        previous.filter((summary) => summary.cluster_id !== clusterId),
       );
+      clusterSummaryCacheRef.current.delete(clusterId);
       setExitingClusterIds((previous) =>
         previous.filter((id) => id !== clusterId),
       );
@@ -654,11 +641,22 @@ export function PeopleGrid({
     );
   }
 
+  for (const summary of unnamedClusters) {
+    clusterSummaryCacheRef.current.set(summary.cluster_id, summary);
+  }
+
+  const activeClusterIds = new Set(unnamedClusters.map((summary) => summary.cluster_id));
   const visibleClusterIds = [
-    ...unnamedClusterIds,
-    ...exitingClusterIds.filter((id) => !unnamedClusterIds.includes(id)),
+    ...unnamedClusters.map((summary) => summary.cluster_id),
+    ...exitingClusterIds.filter((id) => !activeClusterIds.has(id)),
   ];
-  const uniqueClusterIds = [...new Set(visibleClusterIds)];
+  const uniqueSummaries = [...new Set(visibleClusterIds)]
+    .map(
+      (clusterId) =>
+        unnamedClusters.find((summary) => summary.cluster_id === clusterId) ??
+        clusterSummaryCacheRef.current.get(clusterId),
+    )
+    .filter((summary): summary is UnnamedClusterSummaryItem => summary !== undefined);
 
   return (
     <div className={`space-y-10 ${className}`}>
@@ -673,18 +671,21 @@ export function PeopleGrid({
           </p>
         </div>
 
-        {uniqueClusterIds.length === 0 ? (
+        {uniqueSummaries.length === 0 ? (
           <NewFacesEmptyState />
         ) : (
           <ul className={`${MANAGE_GRID_CLASS} list-none p-0`}>
-            {uniqueClusterIds.map((clusterId) => (
-              <li key={`cluster-${clusterId}`} className={PROFILE_CARD_MIN_H}>
+            {uniqueSummaries.map((summary) => (
+              <li
+                key={`cluster-${summary.cluster_id}`}
+                className={PROFILE_CARD_MIN_H}
+              >
                 <UnnamedClusterCard
-                  clusterId={clusterId}
-                  nameValue={namesInput[clusterId] ?? ""}
-                  inputState={inputStates[clusterId] ?? "idle"}
-                  errorMessage={inputErrors[clusterId] ?? null}
-                  isExiting={exitingClusterIds.includes(clusterId)}
+                  summary={summary}
+                  nameValue={namesInput[summary.cluster_id] ?? ""}
+                  inputState={inputStates[summary.cluster_id] ?? "idle"}
+                  errorMessage={inputErrors[summary.cluster_id] ?? null}
+                  isExiting={exitingClusterIds.includes(summary.cluster_id)}
                   onNameChange={handleNameChange}
                   onCommitName={(id) => {
                     void handleCommitName(id);

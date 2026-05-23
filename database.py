@@ -13,9 +13,10 @@ Data flow (pipeline stages):
         photos              faces              faces.person_id         JOIN people
 
 Table relationships:
-  photos (1) ──< (N) faces (N) >── (0..1) people
+  photos (1) ──< (N) faces — one image, many independent face rows (group photos).
+  faces (N) >── (0..1) people — each face may be labeled separately.
+  faces.cluster_id groups unlabeled detections before assignment to people.
   Deleting a photo CASCADE-deletes its faces (see faces.photo_id FK).
-  faces.cluster_id groups detections before a user assigns a name via people.
 """
 
 from __future__ import annotations
@@ -50,7 +51,10 @@ BOUNDING_BOX_KEYS: Final[tuple[str, ...]] = ("x", "y", "w", "h")
 # Legitimate multi-face groups use cluster_id >= 0.
 NAMED_CLUSTER_ID_MIN: Final[int] = 0
 
-PHOTO_COLUMNS: Final[str] = "id, file_path, date_added, processed"
+PHOTO_COLUMNS: Final[str] = "id, file_path, date_added, processed, has_faces"
+PHOTO_COLUMNS_ALIASED: Final[str] = (
+    "p.id, p.file_path, p.date_added, p.processed, p.has_faces"
+)
 FACE_COLUMNS: Final[str] = (
     "id, photo_id, embedding, bounding_box, cluster_id, person_id"
 )
@@ -283,21 +287,29 @@ class PhotoRow:
         file_path: Unique absolute or relative path to the image file.
         date_added: ISO-like timestamp string assigned by SQLite DEFAULT.
         processed: True when face detection / indexing completed (stored as 0/1 in DB).
+        has_faces: True when at least one face row exists; False for faceless images.
     """
 
     id: int
     file_path: str
     date_added: str
     processed: bool
+    has_faces: bool
 
     @classmethod
     def from_sqlite_row(cls, row: sqlite3.Row) -> PhotoRow:
         """Build PhotoRow from sqlite3.Row, converting INTEGER 0/1 → bool."""
+        keys = row.keys()
+        if "has_faces" in keys:
+            has_faces = bool(row["has_faces"])
+        else:
+            has_faces = True
         return cls(
             id=int(row["id"]),
             file_path=str(row["file_path"]),
             date_added=str(row["date_added"]),
             processed=bool(row["processed"]),
+            has_faces=has_faces,
         )
 
 
@@ -369,6 +381,17 @@ class PersonRow:
 
 
 @dataclass(frozen=True, slots=True)
+class UnnamedClusterSummary:
+    """Exemplar face metadata for an unnamed DBSCAN cluster (UI thumbnails)."""
+
+    cluster_id: int
+    exemplar_face_id: int
+    photo_id: int
+    bounding_box: dict[str, int]
+    face_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class PersonWithFaceCount:
     """
     Aggregated person record for UI galleries.
@@ -378,23 +401,36 @@ class PersonWithFaceCount:
         name: Assigned display name, or None.
         face_count: Number of faces linked via `faces.person_id`.
         exemplar_photo_path: File path of one representative photo, or None.
+        exemplar_face_id: Lowest linked face id used for cropped thumbnails.
+        exemplar_bounding_box: Pixel bbox {x, y, w, h} for the exemplar face.
     """
 
     id: int
     name: Optional[str]
     face_count: int
     exemplar_photo_path: Optional[str]
+    exemplar_face_id: Optional[int]
+    exemplar_bounding_box: Optional[dict[str, int]]
 
     @classmethod
     def from_sqlite_row(cls, row: sqlite3.Row) -> PersonWithFaceCount:
         """Build PersonWithFaceCount from a joined aggregate query row."""
         raw_name = row["name"]
         raw_path = row["exemplar_photo_path"]
+        raw_face_id = row["exemplar_face_id"] if "exemplar_face_id" in row.keys() else None
+        raw_bbox = (
+            row["exemplar_bounding_box"] if "exemplar_bounding_box" in row.keys() else None
+        )
+        bbox: Optional[dict[str, int]] = None
+        if raw_bbox is not None:
+            bbox = deserialize_bounding_box(str(raw_bbox))
         return cls(
             id=int(row["id"]),
             name=str(raw_name) if raw_name is not None else None,
             face_count=int(row["face_count"]),
             exemplar_photo_path=str(raw_path) if raw_path is not None else None,
+            exemplar_face_id=int(raw_face_id) if raw_face_id is not None else None,
+            exemplar_bounding_box=bbox,
         )
 
 
@@ -639,7 +675,33 @@ class DatabaseManager:
           - faces.cluster_id
           - faces.person_id (legacy databases created before people FK)
           - people.created_at (legacy people table without timestamp)
+          - photos.has_faces (faceless vs portrait/people images)
         """
+        if self._table_exists(connection, "photos"):
+            photo_columns = self._table_columns(connection, "photos")
+            if "has_faces" not in photo_columns:
+                self._execute(
+                    connection,
+                    """
+                    ALTER TABLE photos
+                    ADD COLUMN has_faces INTEGER NOT NULL DEFAULT 1
+                    CHECK (has_faces IN (0, 1))
+                    """,
+                )
+                self._execute(
+                    connection,
+                    """
+                    UPDATE photos
+                    SET has_faces = CASE
+                        WHEN EXISTS (
+                            SELECT 1 FROM faces AS f WHERE f.photo_id = photos.id
+                        ) THEN 1
+                        ELSE 0
+                    END
+                    WHERE processed = 1
+                    """,
+                )
+
         if self._table_exists(connection, "people"):
             people_columns = self._table_columns(connection, "people")
             if "created_at" not in people_columns:
@@ -673,6 +735,7 @@ class DatabaseManager:
         index_statements: list[str] = [
             "CREATE INDEX IF NOT EXISTS idx_photos_file_path ON photos(file_path)",
             "CREATE INDEX IF NOT EXISTS idx_photos_processed ON photos(processed)",
+            "CREATE INDEX IF NOT EXISTS idx_photos_faceless ON photos(has_faces) WHERE processed = 1 AND has_faces = 0",
             "CREATE INDEX IF NOT EXISTS idx_people_name ON people(name COLLATE NOCASE)",
             "CREATE INDEX IF NOT EXISTS idx_faces_photo_id ON faces(photo_id)",
             "CREATE INDEX IF NOT EXISTS idx_faces_unassigned ON faces(photo_id) WHERE person_id IS NULL",
@@ -722,7 +785,8 @@ class DatabaseManager:
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             file_path   TEXT UNIQUE NOT NULL,
             date_added  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            processed   INTEGER NOT NULL DEFAULT 0 CHECK (processed IN (0, 1))
+            processed   INTEGER NOT NULL DEFAULT 0 CHECK (processed IN (0, 1)),
+            has_faces   INTEGER NOT NULL DEFAULT 1 CHECK (has_faces IN (0, 1))
         );
 
         CREATE TABLE IF NOT EXISTS people (
@@ -782,8 +846,8 @@ class DatabaseManager:
             cursor = self._execute(
                 connection,
                 """
-                INSERT OR IGNORE INTO photos (file_path, processed)
-                VALUES (?, 0)
+                INSERT OR IGNORE INTO photos (file_path, processed, has_faces)
+                VALUES (?, 0, 1)
                 """,
                 (normalized_path,),
             )
@@ -815,33 +879,39 @@ class DatabaseManager:
             )
             return existing_id
 
-    def mark_photo_as_processed(self, photo_id: int) -> None:
+    def mark_photo_as_processed(
+        self, photo_id: int, *, has_faces: bool = True
+    ) -> None:
         """
-        Mark a photo as fully processed (`processed = 1`).
+        Mark a photo as fully processed (`processed = 1`) and record face detection outcome.
 
         Args:
             photo_id: Target `photos.id`.
+            has_faces: False when ingestion found zero faces (faceless; no re-scan).
 
         Raises:
             ValidationError: Invalid id.
             RecordNotFoundError: No matching photo.
         """
         valid_id = self._validate_positive_int(photo_id, "photo_id")
+        has_faces_int = 1 if has_faces else 0
 
         with self._managed_connection() as connection:
             result = self._execute(
                 connection,
                 """
                 UPDATE photos
-                SET processed = 1
+                SET processed = 1, has_faces = ?
                 WHERE id = ?
                 """,
-                (valid_id,),
+                (has_faces_int, valid_id),
             )
             if result.rowcount == 0:
                 raise RecordNotFoundError(f"No photo found with id={valid_id}")
 
-        LOGGER.debug("Marked photo id=%s as processed", valid_id)
+        LOGGER.debug(
+            "Marked photo id=%s as processed (has_faces=%s)", valid_id, has_faces
+        )
 
     def reset_photo_processed(self, photo_id: int) -> None:
         """
@@ -906,6 +976,7 @@ class DatabaseManager:
         self,
         *,
         processed_only: Optional[bool] = None,
+        faceless_only: bool = False,
         limit: Optional[int] = None,
         offset: int = 0,
     ) -> list[PhotoRow]:
@@ -914,6 +985,7 @@ class DatabaseManager:
 
         Args:
             processed_only: If True, only processed; if False, only unprocessed; if None, all.
+            faceless_only: If True, only processed images with zero detected faces.
             limit: Maximum rows (None = no limit).
             offset: SQL OFFSET (must be >= 0).
         """
@@ -925,7 +997,9 @@ class DatabaseManager:
         clauses: list[str] = []
         params: list[object] = []
 
-        if processed_only is True:
+        if faceless_only:
+            clauses.extend(["processed = 1", "has_faces = 0"])
+        elif processed_only is True:
             clauses.append("processed = 1")
         elif processed_only is False:
             clauses.append("processed = 0")
@@ -1174,23 +1248,107 @@ class DatabaseManager:
         faces stored with ``cluster_id IS NULL`` are excluded so the UI is not flooded
         with single-face background detections.
         """
+        summaries = self.get_unnamed_cluster_summaries()
+        cluster_ids = [summary.cluster_id for summary in summaries]
+        LOGGER.debug("get_unnamed_clusters → %s cluster(s)", len(cluster_ids))
+        return cluster_ids
+
+    def get_unnamed_cluster_summaries(self) -> list[UnnamedClusterSummary]:
+        """Return unnamed clusters with exemplar face bounding boxes for the UI."""
         with self._managed_connection() as connection:
             rows = self._execute(
                 connection,
                 """
-                SELECT DISTINCT cluster_id
-                FROM faces
-                WHERE cluster_id IS NOT NULL
-                  AND cluster_id >= ?
-                  AND person_id IS NULL
+                WITH ranked AS (
+                    SELECT
+                        cluster_id,
+                        id,
+                        photo_id,
+                        bounding_box,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY cluster_id
+                            ORDER BY id ASC
+                        ) AS rn,
+                        COUNT(*) OVER (PARTITION BY cluster_id) AS face_count
+                    FROM faces
+                    WHERE cluster_id IS NOT NULL
+                      AND cluster_id >= ?
+                      AND person_id IS NULL
+                )
+                SELECT
+                    cluster_id,
+                    id AS exemplar_face_id,
+                    photo_id,
+                    bounding_box,
+                    face_count
+                FROM ranked
+                WHERE rn = 1
                 ORDER BY cluster_id ASC
                 """,
                 (NAMED_CLUSTER_ID_MIN,),
             ).fetchall()
 
-        cluster_ids = [int(row["cluster_id"]) for row in rows]
-        LOGGER.debug("get_unnamed_clusters → %s cluster(s)", len(cluster_ids))
-        return cluster_ids
+        summaries = [
+            UnnamedClusterSummary(
+                cluster_id=int(row["cluster_id"]),
+                exemplar_face_id=int(row["exemplar_face_id"]),
+                photo_id=int(row["photo_id"]),
+                bounding_box=deserialize_bounding_box(str(row["bounding_box"])),
+                face_count=int(row["face_count"]),
+            )
+            for row in rows
+        ]
+        LOGGER.debug(
+            "get_unnamed_cluster_summaries → %s cluster(s)", len(summaries)
+        )
+        return summaries
+
+    def get_exemplar_face_for_cluster(self, cluster_id: int) -> FaceRow:
+        """Return the representative face row for an unnamed cluster."""
+        valid_cluster_id = self._validate_named_cluster_id(cluster_id)
+
+        with self._managed_connection() as connection:
+            row = self._execute(
+                connection,
+                f"""
+                SELECT {FACE_COLUMNS}
+                FROM faces
+                WHERE cluster_id = ?
+                  AND person_id IS NULL
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (valid_cluster_id,),
+            ).fetchone()
+
+        if row is None:
+            raise RecordNotFoundError(
+                f"No unassigned faces found for cluster_id={valid_cluster_id}"
+            )
+        return FaceRow.from_sqlite_row(row)
+
+    def get_exemplar_face_for_person(self, person_id: int) -> FaceRow:
+        """Return the lowest face id linked to a person (stable exemplar)."""
+        valid_person_id = self._validate_positive_int(person_id, "person_id")
+
+        with self._managed_connection() as connection:
+            row = self._execute(
+                connection,
+                f"""
+                SELECT {FACE_COLUMNS}
+                FROM faces
+                WHERE person_id = ?
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (valid_person_id,),
+            ).fetchone()
+
+        if row is None:
+            raise RecordNotFoundError(
+                f"No faces found for person_id={valid_person_id}"
+            )
+        return FaceRow.from_sqlite_row(row)
 
     def get_noise_faces(self) -> list[FaceRow]:
         """
@@ -1510,7 +1668,21 @@ class DatabaseManager:
                         WHERE fx.person_id = pe.id
                         ORDER BY fx.id ASC
                         LIMIT 1
-                    ) AS exemplar_photo_path
+                    ) AS exemplar_photo_path,
+                    (
+                        SELECT fx.id
+                        FROM faces AS fx
+                        WHERE fx.person_id = pe.id
+                        ORDER BY fx.id ASC
+                        LIMIT 1
+                    ) AS exemplar_face_id,
+                    (
+                        SELECT fx.bounding_box
+                        FROM faces AS fx
+                        WHERE fx.person_id = pe.id
+                        ORDER BY fx.id ASC
+                        LIMIT 1
+                    ) AS exemplar_bounding_box
                 FROM people AS pe
                 LEFT JOIN faces AS f ON f.person_id = pe.id
                 GROUP BY pe.id, pe.name, pe.created_at
@@ -1941,19 +2113,99 @@ class DatabaseManager:
             return int(result.rowcount)
 
     # ------------------------------------------------------------------
+    # Photo discovery via face rows (supports multi-face / group photos)
+    # ------------------------------------------------------------------
+
+    def _fetch_distinct_photos_for_faces(
+        self,
+        where_sql: str,
+        parameters: tuple[object, ...],
+    ) -> list[PhotoRow]:
+        """
+        Return distinct photos that have at least one face matching ``where_sql``.
+
+        ``where_sql`` must reference the ``faces`` table alias ``f`` (e.g. ``f.cluster_id = ?``).
+        """
+        query = f"""
+            SELECT DISTINCT {PHOTO_COLUMNS_ALIASED}
+            FROM photos AS p
+            INNER JOIN faces AS f ON f.photo_id = p.id
+            WHERE {where_sql}
+            ORDER BY p.date_added DESC, p.id DESC
+        """
+        with self._managed_connection() as connection:
+            rows = self._execute(connection, query, parameters).fetchall()
+        return [PhotoRow.from_sqlite_row(row) for row in rows]
+
+    def get_photos_by_cluster_id(self, cluster_id: int) -> list[PhotoRow]:
+        """
+        Return every photo containing at least one face in the DBSCAN cluster.
+
+        Group photos appear once even when multiple faces in the same cluster are present.
+        """
+        valid_cluster_id = self._validate_named_cluster_id(cluster_id)
+        results = self._fetch_distinct_photos_for_faces(
+            "f.cluster_id = ?",
+            (valid_cluster_id,),
+        )
+        LOGGER.debug(
+            "get_photos_by_cluster_id(%s) → %s photo(s)",
+            valid_cluster_id,
+            len(results),
+        )
+        return results
+
+    def get_photos_by_person_ids_any(
+        self, person_ids: Sequence[int]
+    ) -> list[PhotoRow]:
+        """
+        Return photos that contain at least one face assigned to any listed person.
+
+        Other faces in the same photo (other people or unlabeled) do not exclude a match.
+        """
+        unique_ids = self._normalize_positive_int_ids(person_ids, field_name="person_id")
+        if not unique_ids:
+            return []
+
+        placeholders = ", ".join("?" for _ in unique_ids)
+        results = self._fetch_distinct_photos_for_faces(
+            f"f.person_id IN ({placeholders})",
+            tuple(unique_ids),
+        )
+        LOGGER.debug(
+            "get_photos_by_person_ids_any(%r) → %s photo(s)",
+            unique_ids,
+            len(results),
+        )
+        return results
+
+    def _normalize_positive_int_ids(
+        self, values: Sequence[int], *, field_name: str
+    ) -> list[int]:
+        if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+            raise ValidationError(f"{field_name} values must be a sequence of integers")
+
+        unique_ids: list[int] = []
+        seen: set[int] = set()
+        for raw_id in values:
+            valid_id = self._validate_positive_int(int(raw_id), field_name)
+            if valid_id not in seen:
+                seen.add(valid_id)
+                unique_ids.append(valid_id)
+        return unique_ids
+
+    # ------------------------------------------------------------------
     # Search — intersection across people names
     # ------------------------------------------------------------------
 
     def get_photos_by_names(self, names: list[str]) -> list[PhotoRow]:
         """
-        Return photos that contain ALL listed people simultaneously (set intersection).
+        Return photos filtered by labeled person name(s).
 
         Matching rules:
-          - Names are stripped and empty strings ignored.
-          - Duplicate names in the input list are deduplicated.
-          - Only people with non-NULL names participate.
-          - A photo matches iff COUNT(DISTINCT pe.name) for assigned faces on that photo
-            equals the number of required distinct names, and each name is present.
+          - One name: any photo with at least one face assigned to that person (group photos OK).
+          - Multiple names: intersection — every name must appear on the same photo.
+          - Names are stripped; duplicates ignored; only non-NULL ``people.name`` values match.
 
         Args:
             names: List of person display names.
@@ -1965,29 +2217,44 @@ class DatabaseManager:
         if not required_names:
             return []
 
-        name_placeholders = ", ".join("?" for _ in required_names)
-        required_count = len(required_names)
+        if len(required_names) == 1:
+            name_placeholders = "?"
+            results = self._fetch_distinct_photos_for_faces(
+                f"""
+                f.person_id IN (
+                    SELECT pe.id
+                    FROM people AS pe
+                    WHERE pe.name IS NOT NULL
+                      AND pe.name IN ({name_placeholders})
+                )
+                """,
+                (required_names[0],),
+            )
+        else:
+            name_placeholders = ", ".join("?" for _ in required_names)
+            required_count = len(required_names)
 
-        query = f"""
-            SELECT {PHOTO_COLUMNS}
-            FROM photos AS p
-            WHERE (
-                SELECT COUNT(DISTINCT pe.name)
-                FROM faces AS f
-                INNER JOIN people AS pe ON pe.id = f.person_id
-                WHERE f.photo_id = p.id
-                  AND pe.name IS NOT NULL
-                  AND pe.name IN ({name_placeholders})
-            ) = ?
-            ORDER BY p.date_added DESC, p.id DESC
-        """
+            query = f"""
+                SELECT {PHOTO_COLUMNS}
+                FROM photos AS p
+                WHERE (
+                    SELECT COUNT(DISTINCT pe.name)
+                    FROM faces AS f
+                    INNER JOIN people AS pe ON pe.id = f.person_id
+                    WHERE f.photo_id = p.id
+                      AND pe.name IS NOT NULL
+                      AND pe.name IN ({name_placeholders})
+                ) = ?
+                ORDER BY p.date_added DESC, p.id DESC
+            """
 
-        parameters: tuple[object, ...] = tuple(required_names) + (required_count,)
+            parameters: tuple[object, ...] = tuple(required_names) + (required_count,)
 
-        with self._managed_connection() as connection:
-            rows = self._execute(connection, query, parameters).fetchall()
+            with self._managed_connection() as connection:
+                rows = self._execute(connection, query, parameters).fetchall()
 
-        results = [PhotoRow.from_sqlite_row(row) for row in rows]
+            results = [PhotoRow.from_sqlite_row(row) for row in rows]
+
         LOGGER.debug(
             "get_photos_by_names(%r) → %s photo(s)", required_names, len(results)
         )
@@ -1995,23 +2262,17 @@ class DatabaseManager:
 
     def get_photos_by_person_ids(self, person_ids: Sequence[int]) -> list[PhotoRow]:
         """
-        Intersection search by `people.id` instead of display name.
+        Filter photos by ``people.id``.
 
-        Useful when multiple DB rows could theoretically share a name string.
+        - One id: any photo containing that person (includes group shots).
+        - Multiple ids: intersection — photo must include every listed person together.
         """
-        if not isinstance(person_ids, Sequence) or isinstance(person_ids, (str, bytes)):
-            raise ValidationError("person_ids must be a sequence of integers")
-
-        unique_ids: list[int] = []
-        seen: set[int] = set()
-        for raw_id in person_ids:
-            valid_id = self._validate_positive_int(int(raw_id), "person_id")
-            if valid_id not in seen:
-                seen.add(valid_id)
-                unique_ids.append(valid_id)
-
+        unique_ids = self._normalize_positive_int_ids(person_ids, field_name="person_id")
         if not unique_ids:
             return []
+
+        if len(unique_ids) == 1:
+            return self.get_photos_by_person_ids_any(unique_ids)
 
         id_placeholders = ", ".join("?" for _ in unique_ids)
         required_count = len(unique_ids)
@@ -2033,7 +2294,11 @@ class DatabaseManager:
         with self._managed_connection() as connection:
             rows = self._execute(connection, query, parameters).fetchall()
 
-        return [PhotoRow.from_sqlite_row(row) for row in rows]
+        results = [PhotoRow.from_sqlite_row(row) for row in rows]
+        LOGGER.debug(
+            "get_photos_by_person_ids(%r) → %s photo(s)", unique_ids, len(results)
+        )
+        return results
 
     # ------------------------------------------------------------------
     # Maintenance / diagnostics
@@ -2296,6 +2561,12 @@ def _run_smoke_test() -> None:
 
         only_anna = manager.get_photos_by_names(["Anna"])
         assert {photo.id for photo in only_anna} == {solo_photo_id, duo_photo_id}
+
+        cluster_photos = manager.get_photos_by_cluster_id(cluster_a_id)
+        assert {photo.id for photo in cluster_photos} == {group_photo_id}
+
+        anna_by_id = manager.get_photos_by_person_ids([anna_id])
+        assert {photo.id for photo in anna_by_id} == {solo_photo_id, duo_photo_id}
 
         anna_and_bartek = manager.get_photos_by_names(["Anna", "Bartek"])
         assert len(anna_and_bartek) == 1 and anna_and_bartek[0].id == duo_photo_id

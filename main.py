@@ -51,10 +51,12 @@ from ai_core import (
     ClusteringError,
     FaceDetectionError,
     ingest_image_to_database,
+    verify_ai_runtime_dependencies,
 )
 from database import (
     DatabaseError,
     DatabaseManager,
+    FaceRow,
     RecordNotFoundError,
     ValidationError,
 )
@@ -92,6 +94,35 @@ API_PREFIX: Final[str] = "/api"
 DEV_SCAN_FOLDER: Final[str] = os.environ.get(
     "PHOTO_ORGANIZER_DEV_SCAN_FOLDER",
     r"C:\PhotoTest",
+)
+
+DEFAULT_MAX_SCAN_FILES: Final[int] = 20_000
+
+# Directory names skipped during recursive scan (case-insensitive).
+EXCLUDED_SCAN_DIR_NAMES: Final[frozenset[str]] = frozenset(
+    {
+        ".git",
+        ".svn",
+        ".hg",
+        "__pycache__",
+        "node_modules",
+        "venv",
+        ".venv",
+        "target",
+        "dist",
+        "build",
+        "windows",
+        "program files",
+        "program files (x86)",
+        "programdata",
+        "$recycle.bin",
+        "system volume information",
+        "appdata",
+        "application data",
+        "msocache",
+        "recovery",
+        "perflogs",
+    }
 )
 
 THUMBNAIL_CACHE_DIR: Final[Path] = PROJECT_ROOT / ".thumbnail_cache"
@@ -186,11 +217,45 @@ class SearchResultItem(BaseModel):
     file_path: str = Field(..., min_length=1)
 
 
+class BoundingBoxModel(BaseModel):
+    """Pixel bounding box stored in faces.bounding_box JSON (x, y, w, h)."""
+
+    x: int = Field(..., ge=0)
+    y: int = Field(..., ge=0)
+    w: int = Field(..., ge=1)
+    h: int = Field(..., ge=1)
+
+
+class FacePreviewItem(BaseModel):
+    """Face metadata for cropped avatar thumbnails in the UI."""
+
+    face_id: int = Field(..., ge=1)
+    photo_id: int = Field(..., ge=1)
+    bounding_box: BoundingBoxModel
+    thumbnail_url: str = Field(
+        ...,
+        min_length=1,
+        description="JPEG thumbnail URL (use ?crop=1 for face-centered crop).",
+    )
+
+
+class UnnamedClusterSummaryItem(BaseModel):
+    """Unnamed DBSCAN cluster with exemplar face geometry for the People UI."""
+
+    cluster_id: int = Field(..., ge=0)
+    exemplar_face_id: int = Field(..., ge=1)
+    photo_id: int = Field(..., ge=1)
+    bounding_box: BoundingBoxModel
+    face_count: int = Field(..., ge=1)
+    thumbnail_url: str = Field(..., min_length=1)
+
+
 class NoiseFaceItem(BaseModel):
     """One DBSCAN noise face for the Noise Inspector UI."""
 
     face_id: int = Field(..., ge=1)
     photo_id: int = Field(..., ge=1)
+    bounding_box: BoundingBoxModel
     thumbnail_url: str = Field(
         ...,
         min_length=1,
@@ -346,6 +411,15 @@ class PersonSummaryItem(BaseModel):
     exemplar_photo_path: Optional[str] = Field(
         None,
         description="Filesystem path of one representative photo for UI thumbnails.",
+    )
+    exemplar_face_id: Optional[int] = Field(
+        None,
+        ge=1,
+        description="Representative face id for cropped thumbnails.",
+    )
+    bounding_box: Optional[BoundingBoxModel] = Field(
+        None,
+        description="Bounding box of the exemplar face in pixel coordinates.",
     )
 
 
@@ -519,6 +593,121 @@ class ThumbnailEngine:
 
         return target_width, target_height
 
+    def build_face_cache_path(
+        self,
+        source_path: Path,
+        bounding_box: dict[str, int],
+        *,
+        width: int,
+    ) -> Path:
+        """Deterministic cache path for a face crop derived from ``bounding_box``."""
+        resolved_source = source_path.resolve()
+        bbox_token = (
+            f"x={bounding_box['x']}|y={bounding_box['y']}|"
+            f"w={bounding_box['w']}|h={bounding_box['h']}"
+        )
+        fingerprint = f"{resolved_source}|face|{bbox_token}|w={width}"
+        digest = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+        cache_name = self._sanitize_cache_filename(digest)
+        cache_path = (self.cache_dir / cache_name).resolve()
+
+        if self.cache_dir not in cache_path.parents and cache_path != self.cache_dir:
+            raise ValueError("face thumbnail cache path escaped cache directory")
+
+        return cache_path
+
+    @staticmethod
+    def _crop_face_region(
+        image: Image.Image,
+        bounding_box: dict[str, int],
+        *,
+        padding_ratio: float = 0.35,
+    ) -> Image.Image:
+        """Crop a square-ish region around a face with proportional padding."""
+        image_width, image_height = image.size
+        x = int(bounding_box["x"])
+        y = int(bounding_box["y"])
+        w = max(1, int(bounding_box["w"]))
+        h = max(1, int(bounding_box["h"]))
+
+        pad_x = int(w * padding_ratio)
+        pad_y = int(h * padding_ratio)
+        left = max(0, x - pad_x)
+        top = max(0, y - pad_y)
+        right = min(image_width, x + w + pad_x)
+        bottom = min(image_height, y + h + pad_y)
+
+        if right <= left or bottom <= top:
+            raise ValueError("invalid face bounding box for crop")
+
+        return image.crop((left, top, right, bottom))
+
+    def _generate_face_thumbnail_file(
+        self,
+        source_path: Path,
+        cache_path: Path,
+        bounding_box: dict[str, int],
+        *,
+        width: int,
+    ) -> None:
+        image = self._open_image_unicode_safe(source_path)
+        try:
+            cropped = self._crop_face_region(image, bounding_box)
+            target_size = self._compute_thumbnail_size(
+                cropped.width,
+                cropped.height,
+                target_width=width,
+                target_height=None,
+            )
+            resized = cropped.copy()
+            resized.thumbnail(target_size, Image.Resampling.LANCZOS)
+
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            resized.save(
+                cache_path,
+                format="JPEG",
+                quality=THUMBNAIL_JPEG_QUALITY,
+                optimize=True,
+            )
+            LOGGER.debug(
+                "Face thumbnail generated source=%s cache=%s bbox=%s",
+                source_path,
+                cache_path,
+                bounding_box,
+            )
+        finally:
+            image.close()
+
+    def get_or_create_face_thumbnail(
+        self,
+        source_path: Path,
+        bounding_box: dict[str, int],
+        *,
+        width: int,
+    ) -> Path:
+        """Return a cached JPEG cropped to the supplied face bounding box."""
+        cache_path = self.build_face_cache_path(
+            source_path,
+            bounding_box,
+            width=width,
+        )
+
+        if cache_path.is_file():
+            return cache_path
+
+        with self._io_lock:
+            if cache_path.is_file():
+                return cache_path
+
+            self._generate_face_thumbnail_file(
+                source_path=source_path,
+                cache_path=cache_path,
+                bounding_box=bounding_box,
+                width=width,
+            )
+
+        return cache_path
+
     def _generate_thumbnail_file(
         self,
         source_path: Path,
@@ -651,6 +840,31 @@ def get_services() -> AppServices:
 # ---------------------------------------------------------------------------
 
 
+def _max_scan_files() -> int:
+    raw = os.environ.get("PHOTO_ORGANIZER_MAX_SCAN_FILES", "").strip()
+    if not raw:
+        return DEFAULT_MAX_SCAN_FILES
+    try:
+        limit = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "PHOTO_ORGANIZER_MAX_SCAN_FILES must be a positive integer"
+        ) from exc
+    if limit <= 0:
+        raise ValueError("PHOTO_ORGANIZER_MAX_SCAN_FILES must be a positive integer")
+    return limit
+
+
+def _is_blocked_scan_directory(directory: Path) -> bool:
+    """Return True when `directory` must not be traversed during ingestion."""
+    name = directory.name.lower()
+    if name in EXCLUDED_SCAN_DIR_NAMES:
+        return True
+    if name.startswith("$"):
+        return True
+    return False
+
+
 def resolve_and_validate_folder(folder_path: str) -> Path:
     """
     Resolve `folder_path` to an absolute directory on disk.
@@ -670,6 +884,14 @@ def resolve_and_validate_folder(folder_path: str) -> Path:
 
     if not resolved.is_dir():
         raise NotADirectoryError(f"Path is not a directory: {resolved}")
+
+    # Reject drive roots (e.g. C:\) — accidental full-disk scans are destructive.
+    normalized = str(resolved).rstrip("\\/")
+    drive, tail = os.path.splitdrive(normalized)
+    if drive and not tail.lstrip("\\/"):
+        raise ValueError(
+            f"Refusing to scan drive root {resolved}. Select a photo folder, not an entire disk."
+        )
 
     return resolved
 
@@ -750,28 +972,86 @@ async def build_photo_thumbnail_file_response(
     )
 
 
+async def build_face_thumbnail_file_response(
+    services: AppServices,
+    face_row: FaceRow,
+    *,
+    width: int,
+    height: Optional[int],
+) -> FileResponse:
+    """Build a face-centered JPEG thumbnail using the stored bounding box."""
+    if width <= 0:
+        raise ValueError("width must be a positive integer")
+    if height is not None and height <= 0:
+        raise ValueError("height must be a positive integer when provided")
+
+    photo_row = services.database.get_photo_by_id(face_row.photo_id)
+    if photo_row is None:
+        raise RecordNotFoundError(f"No photo found with id={face_row.photo_id}")
+
+    source_path = resolve_photo_source_path(photo_row.file_path)
+
+    thumbnail_path = await asyncio.to_thread(
+        services.thumbnail_engine.get_or_create_face_thumbnail,
+        source_path,
+        face_row.bounding_box,
+        width=width,
+    )
+
+    if not thumbnail_path.is_file():
+        raise FileNotFoundError(
+            f"Face thumbnail file missing after generation: {thumbnail_path}"
+        )
+
+    return FileResponse(
+        path=str(thumbnail_path),
+        media_type="image/jpeg",
+        filename=thumbnail_path.name,
+    )
+
+
 def discover_image_files_recursively(folder: Path) -> list[Path]:
     """
     Recursively collect .jpg / .jpeg / .png files under `folder`.
 
+    Skips known system / dependency directories and enforces ``PHOTO_ORGANIZER_MAX_SCAN_FILES``.
+
     Returns:
         Sorted list of absolute file paths (stable ingestion order).
+
+    Raises:
+        ValueError: When the discovered file count exceeds the configured limit.
     """
     discovered: list[Path] = []
+    max_files = _max_scan_files()
 
-    for candidate in folder.rglob("*"):
-        if not candidate.is_file():
-            continue
-        if candidate.suffix.lower() not in SCAN_IMAGE_SUFFIXES:
-            continue
-        discovered.append(candidate.resolve())
+    for dirpath, dirnames, filenames in os.walk(folder, topdown=True):
+        current_dir = Path(dirpath)
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if not _is_blocked_scan_directory(current_dir / name)
+        ]
+
+        for filename in filenames:
+            candidate = (current_dir / filename).resolve()
+            if candidate.suffix.lower() not in SCAN_IMAGE_SUFFIXES:
+                continue
+            discovered.append(candidate)
+            if len(discovered) > max_files:
+                raise ValueError(
+                    f"Folder contains more than {max_files} images "
+                    f"(limit PHOTO_ORGANIZER_MAX_SCAN_FILES). "
+                    f"Choose a narrower folder or raise the limit."
+                )
 
     discovered.sort(key=lambda path: str(path).lower())
     LOGGER.info(
-        "Discovered %s image file(s) under %s (suffixes=%s)",
+        "Discovered %s image file(s) under %s (suffixes=%s, max=%s)",
         len(discovered),
         folder,
         sorted(SCAN_IMAGE_SUFFIXES),
+        max_files,
     )
     return discovered
 
@@ -825,23 +1105,48 @@ def parse_comma_separated_person_ids(person_ids_parameter: str) -> list[int]:
     return person_ids
 
 
-def resolve_gallery_processed_filter(ai_status: str) -> Optional[bool]:
+def resolve_gallery_ai_filter(ai_status: str) -> tuple[Optional[bool], bool]:
     """
-    Map gallery `ai_status` query string to DatabaseManager.get_all_photos processed_only.
+    Map gallery ``ai_status`` to database filters.
 
     Returns:
-        None for all photos, True for processed-only, False for unprocessed-only.
+        (processed_only, faceless_only) — at most one restrictive flag is active.
     """
     normalized = ai_status.strip().lower()
     if normalized == "all":
-        return None
+        return None, False
     if normalized == "processed":
-        return True
+        return True, False
     if normalized == "unprocessed":
-        return False
+        return False, False
+    if normalized == "faceless":
+        return None, True
     raise ValueError(
-        "ai_status must be one of: all, processed, unprocessed "
+        "ai_status must be one of: all, processed, unprocessed, faceless "
         f"(got {ai_status!r})"
+    )
+
+
+def bounding_box_to_model(bounding_box: dict[str, int]) -> BoundingBoxModel:
+    """Convert a validated database bounding box dict to an API model."""
+    return BoundingBoxModel(
+        x=int(bounding_box["x"]),
+        y=int(bounding_box["y"]),
+        w=int(bounding_box["w"]),
+        h=int(bounding_box["h"]),
+    )
+
+
+def face_preview_item_from_row(face_row: FaceRow, *, width: int) -> FacePreviewItem:
+    """Build a FacePreviewItem with a crop thumbnail URL for a face row."""
+    return FacePreviewItem(
+        face_id=face_row.id,
+        photo_id=face_row.photo_id,
+        bounding_box=bounding_box_to_model(face_row.bounding_box),
+        thumbnail_url=(
+            f"{API_PREFIX}/faces/{face_row.id}/thumbnail"
+            f"?crop=1&width={width}"
+        ),
     )
 
 
@@ -1104,6 +1409,8 @@ async def start_folder_scan(
                 detail="Scanner is already active (could not acquire scan lock).",
             )
 
+        services.ai_engine.reset_runtime()
+
         services.scan_task = asyncio.create_task(
             _execute_folder_scan_async(
                 services=services,
@@ -1153,6 +1460,8 @@ async def lifespan(application: FastAPI):
     global _services
 
     LOGGER.info("Starting photo organizer sidecar (offline FastAPI)")
+
+    verify_ai_runtime_dependencies()
 
     database = DatabaseManager(db_path=DEFAULT_DATABASE_PATH)
     database.create_tables()
@@ -1367,7 +1676,7 @@ def register_routes(application: FastAPI) -> None:
         ),
         ai_status: str = Query(
             "all",
-            description="Filter by ingestion status: all | processed | unprocessed.",
+            description="Filter by ingestion status: all | processed | unprocessed | faceless.",
             examples=["processed"],
         ),
     ) -> list[SearchResultItem]:
@@ -1375,14 +1684,17 @@ def register_routes(application: FastAPI) -> None:
         Gallery listing for the desktop UI.
 
         When person_ids is omitted or empty, returns all photos (subject to ai_status).
-        When person_ids is set, returns photos where every listed person appears together.
+        When one person_id is set, returns every photo that contains that person (group shots included).
+        When multiple person_ids are set, returns photos where every listed person appears together.
         """
         try:
             services = get_services()
-            processed_only = resolve_gallery_processed_filter(ai_status)
+            processed_only, faceless_only = resolve_gallery_ai_filter(ai_status)
             person_id_list = parse_comma_separated_person_ids(person_ids)
 
-            if person_id_list:
+            if faceless_only:
+                photo_rows = services.database.get_all_photos(faceless_only=True)
+            elif person_id_list:
                 photo_rows = services.database.get_photos_by_person_ids(person_id_list)
                 if processed_only is True:
                     photo_rows = [row for row in photo_rows if row.processed]
@@ -1418,24 +1730,38 @@ def register_routes(application: FastAPI) -> None:
 
     @application.get(
         f"{API_PREFIX}/clusters/unnamed",
-        response_model=list[int],
+        response_model=list[UnnamedClusterSummaryItem],
         responses={
             status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": ErrorResponse},
         },
         tags=["clusters"],
-        summary="List DBSCAN cluster IDs awaiting a human-assigned name",
+        summary="List unnamed DBSCAN clusters with exemplar face geometry",
     )
-    async def get_unnamed_clusters() -> list[int]:
+    async def get_unnamed_clusters() -> list[UnnamedClusterSummaryItem]:
         """
-        Return cluster_id values persisted in SQLite that are not yet linked to `people`.
+        Return unnamed clusters with bounding boxes for face-centered UI thumbnails.
 
         DBSCAN noise faces (cluster_id NULL) are excluded by the database layer.
         """
         try:
             services = get_services()
-            cluster_ids = services.database.get_unnamed_clusters()
-            LOGGER.info("GET /api/clusters/unnamed → %s cluster(s)", len(cluster_ids))
-            return cluster_ids
+            summaries = services.database.get_unnamed_cluster_summaries()
+            results = [
+                UnnamedClusterSummaryItem(
+                    cluster_id=summary.cluster_id,
+                    exemplar_face_id=summary.exemplar_face_id,
+                    photo_id=summary.photo_id,
+                    bounding_box=bounding_box_to_model(summary.bounding_box),
+                    face_count=summary.face_count,
+                    thumbnail_url=(
+                        f"{API_PREFIX}/faces/{summary.exemplar_face_id}/thumbnail"
+                        f"?crop=1&width={THUMBNAIL_DEFAULT_WIDTH}"
+                    ),
+                )
+                for summary in summaries
+            ]
+            LOGGER.info("GET /api/clusters/unnamed → %s cluster(s)", len(results))
+            return results
         except HTTPException:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -1464,9 +1790,10 @@ def register_routes(application: FastAPI) -> None:
                 NoiseFaceItem(
                     face_id=face.id,
                     photo_id=face.photo_id,
+                    bounding_box=bounding_box_to_model(face.bounding_box),
                     thumbnail_url=(
                         f"{API_PREFIX}/faces/{face.id}/thumbnail"
-                        f"?width={THUMBNAIL_DEFAULT_WIDTH}"
+                        f"?crop=1&width={THUMBNAIL_DEFAULT_WIDTH}"
                     ),
                 )
                 for face in noise_faces
@@ -1628,6 +1955,12 @@ def register_routes(application: FastAPI) -> None:
                     name=row.name,
                     face_count=row.face_count,
                     exemplar_photo_path=row.exemplar_photo_path,
+                    exemplar_face_id=row.exemplar_face_id,
+                    bounding_box=(
+                        bounding_box_to_model(row.exemplar_bounding_box)
+                        if row.exemplar_bounding_box is not None
+                        else None
+                    ),
                 )
                 for row in rows
             ]
@@ -1804,6 +2137,43 @@ def register_routes(application: FastAPI) -> None:
             raise_http_exception_from_error(exc)
 
     @application.get(
+        f"{API_PREFIX}/clusters/{{cluster_id}}/photos",
+        response_model=list[SearchResultItem],
+        responses={
+            status.HTTP_400_BAD_REQUEST: {"model": ErrorResponse},
+            status.HTTP_404_NOT_FOUND: {"model": ErrorResponse},
+            status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": ErrorResponse},
+        },
+        tags=["clusters"],
+        summary="List every photo containing at least one face in the cluster",
+    )
+    async def get_cluster_photos(cluster_id: int) -> list[SearchResultItem]:
+        """
+        Return all images where any detected face belongs to ``cluster_id``.
+
+        Multi-face photos are included when at least one face matches; other faces in the
+        same image are ignored for filtering purposes.
+        """
+        try:
+            services = get_services()
+            photo_rows = services.database.get_photos_by_cluster_id(cluster_id)
+            results = [
+                SearchResultItem(photo_id=row.id, file_path=row.file_path)
+                for row in photo_rows
+            ]
+            LOGGER.info(
+                "GET /api/clusters/%s/photos → %s photo(s)",
+                cluster_id,
+                len(results),
+            )
+            return results
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("GET /api/clusters/%s/photos failed", cluster_id)
+            raise_http_exception_from_error(exc)
+
+    @application.get(
         f"{API_PREFIX}/clusters/{{cluster_id}}/thumbnail",
         response_class=FileResponse,
         responses={
@@ -1887,8 +2257,12 @@ def register_routes(application: FastAPI) -> None:
             le=THUMBNAIL_MAX_EDGE,
             description="Optional maximum thumbnail height in pixels.",
         ),
+        crop: bool = Query(
+            False,
+            description="When true, crop to the face bounding box before resizing.",
+        ),
     ) -> FileResponse:
-        """Stream a downscaled JPEG for the photo that contains this face."""
+        """Stream a JPEG thumbnail for this face (full photo or face-centered crop)."""
         try:
             if face_id <= 0:
                 raise ValueError("face_id must be a positive integer")
@@ -1898,15 +2272,24 @@ def register_routes(application: FastAPI) -> None:
             if face_row is None:
                 raise RecordNotFoundError(f"No face found with id={face_id}")
 
-            response = await build_photo_thumbnail_file_response(
-                services=services,
-                photo_id=face_row.photo_id,
-                width=width,
-                height=height,
-            )
+            if crop:
+                response = await build_face_thumbnail_file_response(
+                    services=services,
+                    face_row=face_row,
+                    width=width,
+                    height=height,
+                )
+            else:
+                response = await build_photo_thumbnail_file_response(
+                    services=services,
+                    photo_id=face_row.photo_id,
+                    width=width,
+                    height=height,
+                )
             LOGGER.info(
-                "GET /api/faces/%s/thumbnail → photo_id=%s file=%s",
+                "GET /api/faces/%s/thumbnail crop=%s → photo_id=%s file=%s",
                 face_id,
+                crop,
                 face_row.photo_id,
                 response.filename,
             )

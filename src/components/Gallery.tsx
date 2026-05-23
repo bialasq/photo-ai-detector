@@ -27,6 +27,7 @@ const AI_FILTER_OPTIONS: ReadonlyArray<{
   { value: "all", label: "All Photos" },
   { value: "processed", label: "AI Processed Only" },
   { value: "unprocessed", label: "Unprocessed" },
+  { value: "faceless", label: "Faceless / No Faces" },
 ];
 
 function trimDisplayPath(filePath: string): string {
@@ -63,6 +64,39 @@ interface GalleryActiveFilterBadgeProps {
   photoCount: number;
   isLoadingPhotos: boolean;
   onClearPersonFilter: () => void;
+}
+
+interface GalleryFacelessFilterBadgeProps {
+  photoCount: number;
+  isLoadingPhotos: boolean;
+  onClear: () => void;
+}
+
+function GalleryFacelessFilterBadge({
+  photoCount,
+  isLoadingPhotos,
+  onClear,
+}: GalleryFacelessFilterBadgeProps): JSX.Element {
+  return (
+    <div className="flex flex-wrap items-center gap-3 rounded-xl border border-violet-200 bg-violet-50 px-4 py-3 transition-all duration-200">
+      <p className="text-sm text-violet-900">
+        <span className="font-semibold">Viewing:</span> Faceless / No Faces
+        {!isLoadingPhotos && (
+          <span className="ml-2 text-violet-700">
+            · {photoCount} photo{photoCount === 1 ? "" : "s"}
+          </span>
+        )}
+      </p>
+      <button
+        type="button"
+        onClick={onClear}
+        className="inline-flex items-center gap-1.5 rounded-full border border-violet-300 bg-white px-3 py-1 text-xs font-bold uppercase tracking-wide text-violet-800 shadow-sm transition-colors hover:bg-violet-100"
+      >
+        <X className="h-3.5 w-3.5" aria-hidden="true" />
+        Clear filter
+      </button>
+    </div>
+  );
 }
 
 function GalleryActiveFilterBadge({
@@ -126,10 +160,17 @@ function GallerySidebar({
 
   const handleRadioChange = (event: ChangeEvent<HTMLInputElement>): void => {
     const value = event.target.value;
-    if (value === "all" || value === "processed" || value === "unprocessed") {
+    if (
+      value === "all" ||
+      value === "processed" ||
+      value === "unprocessed" ||
+      value === "faceless"
+    ) {
       onAiFilterChange(value);
     }
   };
+
+  const personFilterDisabled = isLoadingPhotos || aiFilter === "faceless";
 
   return (
     <aside className="h-fit w-full shrink-0 space-y-6 rounded-2xl border border-slate-200 bg-white p-5 md:w-64">
@@ -162,7 +203,19 @@ function GallerySidebar({
         <p className="text-xs font-semibold uppercase tracking-wider text-slate-400">
           Filter by person
         </p>
-        <div className="max-h-72 overflow-y-auto pr-1">
+        {aiFilter === "faceless" && (
+          <p className="text-xs text-slate-500">
+            Person filters are disabled while viewing faceless photos (landscapes,
+            architecture, etc.).
+          </p>
+        )}
+        <div
+          className={`max-h-72 overflow-y-auto pr-1 ${
+            personFilterDisabled && aiFilter === "faceless"
+              ? "pointer-events-none opacity-50"
+              : ""
+          }`}
+        >
           <PeopleGrid
             key={peopleGridRefreshKey}
             mode="filter"
@@ -564,6 +617,9 @@ export function Gallery(): JSX.Element {
 
   const handleAiFilterChange = (filter: GalleryAiFilter): void => {
     setAiFilter(filter);
+    if (filter === "faceless") {
+      setSelectedPersonIds([]);
+    }
   };
 
   const handleClearPersonFilter = (): void => {
@@ -580,6 +636,7 @@ export function Gallery(): JSX.Element {
   );
 
   const personFilterActive = selectedPersonIds.length > 0;
+  const facelessFilterActive = aiFilter === "faceless";
 
   const handleOpenPhoto = (photoId: number): void => {
     setActivePhotoId(photoId);
@@ -600,7 +657,15 @@ export function Gallery(): JSX.Element {
         />
       )}
 
-      {personFilterActive && (
+      {facelessFilterActive && (
+        <GalleryFacelessFilterBadge
+          photoCount={photos.length}
+          isLoadingPhotos={isLoadingPhotos}
+          onClear={() => setAiFilter("all")}
+        />
+      )}
+
+      {personFilterActive && !facelessFilterActive && (
         <GalleryActiveFilterBadge
           selectedPeople={selectedPeople}
           photoCount={photos.length}

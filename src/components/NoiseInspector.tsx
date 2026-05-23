@@ -5,14 +5,9 @@ import {
   useState,
   type KeyboardEvent,
 } from "react";
-import {
-  ChevronDown,
-  ImageOff,
-  Loader2,
-  UserPlus,
-  VolumeX,
-} from "lucide-react";
+import { ChevronDown, Loader2, UserPlus, VolumeX } from "lucide-react";
 import * as api from "@/services/api";
+import { FaceCropImage } from "@/components/FaceCropImage";
 import type { NoiseFaceItem, PersonSummaryItem } from "@/types/api";
 
 const NOISE_EXIT_MS = 400;
@@ -48,12 +43,7 @@ function NoiseFaceAvatar({
   isAssigning,
   onOpenMenu,
 }: NoiseFaceAvatarProps): JSX.Element {
-  const [imageFailed, setImageFailed] = useState(false);
   const thumbnailUrl = api.resolveNoiseFaceThumbnailUrl(face, 96);
-
-  useEffect(() => {
-    setImageFailed(false);
-  }, [face.face_id]);
 
   return (
     <button
@@ -72,18 +62,7 @@ function NoiseFaceAvatar({
           : "border-slate-200 hover:border-amber-300 hover:shadow-sm"
       }`}
     >
-      {!imageFailed ? (
-        <img
-          src={thumbnailUrl}
-          alt=""
-          className="h-full w-full object-cover"
-          onError={() => setImageFailed(true)}
-        />
-      ) : (
-        <span className="flex h-full w-full items-center justify-center text-slate-400">
-          <ImageOff className="h-4 w-4" aria-hidden="true" />
-        </span>
-      )}
+      <FaceCropImage thumbnailUrl={thumbnailUrl} alt="" className="h-full w-full object-cover" />
       {isAssigning && (
         <span className="absolute inset-0 flex items-center justify-center bg-white/70">
           <Loader2 className="h-4 w-4 animate-spin text-amber-600" aria-hidden="true" />
@@ -110,6 +89,7 @@ export function NoiseInspector({
 
   const sectionRef = useRef<HTMLElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
+  const noiseFaceCacheRef = useRef<Map<number, NoiseFaceItem>>(new Map());
 
   const profiles = namedPeople.filter(isNamedPerson);
 
@@ -119,6 +99,9 @@ export function NoiseInspector({
 
     try {
       const rows = await api.getNoiseFaces();
+      noiseFaceCacheRef.current = new Map(
+        rows.map((face) => [face.face_id, face]),
+      );
       setNoiseFaces(rows);
       setExitingFaceIds([]);
     } catch (loadError: unknown) {
@@ -234,23 +217,22 @@ export function NoiseInspector({
     }
   };
 
-  const visibleFaces = [
-    ...noiseFaces,
-    ...exitingFaceIds
-      .filter((id) => !noiseFaces.some((face) => face.face_id === id))
-      .map(
-        (faceId) =>
-          ({
-            face_id: faceId,
-            photo_id: 0,
-            thumbnail_url: api.getNoiseFaceThumbnailUrl(faceId, 96),
-          }) satisfies NoiseFaceItem,
-      ),
-  ];
+  for (const face of noiseFaces) {
+    noiseFaceCacheRef.current.set(face.face_id, face);
+  }
 
-  const uniqueVisibleFaces = [
-    ...new Map(visibleFaces.map((face) => [face.face_id, face])).values(),
+  const activeFaceIds = new Set(noiseFaces.map((face) => face.face_id));
+  const visibleFaceIds = [
+    ...noiseFaces.map((face) => face.face_id),
+    ...exitingFaceIds.filter((id) => !activeFaceIds.has(id)),
   ];
+  const uniqueVisibleFaces = [...new Set(visibleFaceIds)]
+    .map(
+      (faceId) =>
+        noiseFaces.find((face) => face.face_id === faceId) ??
+        noiseFaceCacheRef.current.get(faceId),
+    )
+    .filter((face): face is NoiseFaceItem => face !== undefined);
 
   return (
     <section

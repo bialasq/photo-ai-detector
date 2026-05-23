@@ -1,8 +1,26 @@
+export interface BoundingBox {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 export interface PersonSummaryItem {
   id: number;
   name: string | null;
   face_count: number;
   exemplar_photo_path: string | null;
+  exemplar_face_id: number | null;
+  bounding_box: BoundingBox | null;
+}
+
+export interface UnnamedClusterSummaryItem {
+  cluster_id: number;
+  exemplar_face_id: number;
+  photo_id: number;
+  bounding_box: BoundingBox;
+  face_count: number;
+  thumbnail_url: string;
 }
 
 export interface SearchResultItem {
@@ -10,7 +28,7 @@ export interface SearchResultItem {
   file_path: string;
 }
 
-export type GalleryAiFilter = "all" | "processed" | "unprocessed";
+export type GalleryAiFilter = "all" | "processed" | "unprocessed" | "faceless";
 
 export interface GalleryQueryParams {
   person_ids: number[];
@@ -40,6 +58,14 @@ export interface ScanFolderRequest {
 export interface NoiseFaceItem {
   face_id: number;
   photo_id: number;
+  bounding_box: BoundingBox;
+  thumbnail_url: string;
+}
+
+export interface FacePreviewItem {
+  face_id: number;
+  photo_id: number;
+  bounding_box: BoundingBox;
   thumbnail_url: string;
 }
 

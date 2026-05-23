@@ -482,15 +482,45 @@ def _import_deepface() -> Any:
     Import DeepFace lazily so module import succeeds in environments without TF.
 
     Raises:
-        FaceDetectionError: If deepface is not installed.
+        FaceDetectionError: If deepface is not installed or incompatible with TensorFlow.
     """
     try:
+        import tf_keras  # noqa: F401 — required by retinaface on TensorFlow 2.21+
+    except ImportError as exc:
+        raise FaceDetectionError(
+            "tf-keras is not installed. Run: pip install tf-keras "
+            "(or pip install -r requirements.txt)"
+        ) from exc
+
+    try:
         from deepface import DeepFace  # type: ignore[import-untyped]
+        from deepface.modules import modeling  # type: ignore[import-untyped]
+
+        if not hasattr(modeling, "build_model"):
+            raise FaceDetectionError(
+                "Incompatible deepface installation (missing modeling.build_model). "
+                "Reinstall: pip install --force-reinstall 'deepface>=0.0.92' tf-keras"
+            )
     except ImportError as exc:
         raise FaceDetectionError(
             "deepface is not installed. Install requirements: pip install -r requirements.txt"
         ) from exc
     return DeepFace
+
+
+def verify_ai_runtime_dependencies() -> None:
+    """
+    Eagerly validate AI stack imports at process startup.
+
+    Raises:
+        FaceDetectionError: When TensorFlow / DeepFace / tf-keras cannot load.
+    """
+    _import_deepface()
+    if not cv2_available():
+        raise FaceDetectionError(
+            "opencv-python is not installed. Run: pip install -r requirements.txt"
+        )
+    LOGGER.info("AI runtime dependencies verified (tf-keras, deepface, opencv)")
 
 
 def _extract_facial_area_as_bbox(facial_area: dict[str, Any]) -> dict[str, int]:
@@ -644,6 +674,17 @@ class AICoreEngine:
         if self._deepface is None:
             self._deepface = _import_deepface()
         return self._deepface
+
+    def reset_runtime(self) -> None:
+        """
+        Clear cached DeepFace import and detector probe state.
+
+        Call before a new folder scan so dependency upgrades or transient import
+        failures in a long-running uvicorn process do not stick across scans.
+        """
+        self._deepface = None
+        self._active_detector_backend = None
+        LOGGER.info("AICoreEngine runtime cache cleared")
 
     @property
     def active_detector_backend(self) -> Optional[str]:
@@ -1350,18 +1391,41 @@ def ingest_image_to_database(
     path = str(Path(file_path).expanduser().resolve())
     existing_photo = database.get_photo_by_path(path)
     if existing_photo is not None and existing_photo.processed:
+        if not existing_photo.has_faces:
+            LOGGER.info(
+                "Skipping faceless processed photo id=%s path=%s",
+                existing_photo.id,
+                path,
+            )
+            return {
+                "photo_id": existing_photo.id,
+                "file_path": path,
+                "face_ids": [],
+                "detection_count": 0,
+                "skipped": True,
+                "faceless": True,
+            }
+
+        existing_faces = database.get_faces_for_photo(existing_photo.id)
+        if existing_faces:
+            LOGGER.info(
+                "Skipping ingestion for already processed photo id=%s path=%s",
+                existing_photo.id,
+                path,
+            )
+            return {
+                "photo_id": existing_photo.id,
+                "file_path": path,
+                "face_ids": [face.id for face in existing_faces],
+                "detection_count": len(existing_faces),
+                "skipped": True,
+                "faceless": False,
+            }
         LOGGER.info(
-            "Skipping ingestion for already processed photo id=%s path=%s",
+            "Re-processing photo id=%s (marked processed but no faces stored): %s",
             existing_photo.id,
             path,
         )
-        return {
-            "photo_id": existing_photo.id,
-            "file_path": path,
-            "face_ids": [],
-            "detection_count": 0,
-            "skipped": True,
-        }
 
     photo_id = database.insert_photo(path)
 
@@ -1378,7 +1442,7 @@ def ingest_image_to_database(
         face_ids.append(face_id)
 
     if mark_processed:
-        database.mark_photo_as_processed(photo_id)
+        database.mark_photo_as_processed(photo_id, has_faces=bool(face_ids))
 
     return {
         "photo_id": photo_id,
@@ -1386,6 +1450,7 @@ def ingest_image_to_database(
         "face_ids": face_ids,
         "detection_count": len(face_ids),
         "skipped": False,
+        "faceless": len(face_ids) == 0,
     }
 
 
