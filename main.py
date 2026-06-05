@@ -89,6 +89,21 @@ DEFAULT_HOST: Final[str] = "127.0.0.1"
 DEFAULT_PORT: Final[int] = 8000
 DEFAULT_DATABASE_PATH: Final[str] = "organizer.db"
 
+DEV_MODE_ENV_VAR: Final[str] = "PHOTO_ORGANIZER_DEV"
+
+
+def is_dev_mode(*, override: bool | None = None) -> bool:
+    """
+    Return True when developer-only HTTP routes may be registered.
+
+    Controlled exclusively by the ``PHOTO_ORGANIZER_DEV`` environment variable
+    (must be exactly ``1``). Defaults to False — release builds never enable
+    dev routes unless the operator explicitly sets the variable.
+    """
+    if override is not None:
+        return override
+    return os.environ.get(DEV_MODE_ENV_VAR, "0").strip() == "1"
+
 API_PREFIX: Final[str] = "/api"
 
 DEV_SCAN_FOLDER: Final[str] = os.environ.get(
@@ -1461,6 +1476,9 @@ async def lifespan(application: FastAPI):
 
     LOGGER.info("Starting photo organizer sidecar (offline FastAPI)")
 
+    if is_dev_mode():
+        LOGGER.warning("DEV endpoints ENABLED — do not use in production")
+
     verify_ai_runtime_dependencies()
 
     database = DatabaseManager(db_path=DEFAULT_DATABASE_PATH)
@@ -1523,7 +1541,7 @@ async def aicore_exception_handler(request: Request, exc: AICoreError) -> JSONRe
     )
 
 
-def create_application() -> FastAPI:
+def create_application(*, dev_mode: bool | None = None) -> FastAPI:
     """Build and configure the FastAPI application instance."""
     application = FastAPI(
         title="Photo Organizer Sidecar API",
@@ -1549,12 +1567,12 @@ def create_application() -> FastAPI:
 
     application.add_exception_handler(AICoreError, aicore_exception_handler)
 
-    register_routes(application)
+    register_routes(application, dev_mode=dev_mode)
     return application
 
 
-def register_routes(application: FastAPI) -> None:
-    """Attach all /api routes to the FastAPI application."""
+def register_routes(application: FastAPI, *, dev_mode: bool | None = None) -> None:
+    """Attach production /api routes; dev-only routes when ``PHOTO_ORGANIZER_DEV=1``."""
 
     @application.get(
         "/health",
@@ -2326,6 +2344,13 @@ def register_routes(application: FastAPI) -> None:
                 height,
             )
             raise_http_exception_from_error(exc)
+
+    if is_dev_mode(override=dev_mode):
+        register_dev_routes(application)
+
+
+def register_dev_routes(application: FastAPI) -> None:
+    """Register ``/api/dev/*`` helpers (localhost sidecar, developer workflows only)."""
 
     @application.post(
         f"{API_PREFIX}/dev/reset-library",

@@ -14,3 +14,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.cursorrules` — Cursor operating contract (anti-hallucination, workflow, pre-PR checklist).
 - GitHub issue import scripts: `scripts/import_issues.sh`, `scripts/setup_labels.sh`.
 - `docs/PRODUCT_SCOPE.md` — MVP v1.0 scope freeze: must-have user stories, explicit out-of-scope list, Windows 10/11 x64-only platform decision, uninstall / `%AppData%` data retention policy (task 0.1).
+- **Security (task 1.2.1):** `/api/dev/*` routes registered only when `PHOTO_ORGANIZER_DEV=1`. Tauri debug builds pass the variable to the sidecar; release builds do not.

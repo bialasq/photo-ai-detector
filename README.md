@@ -111,7 +111,7 @@ This section documents how the application was built — useful for onboarding a
 - FastAPI app with `/health` and `/api/*` routes.
 - Background asyncio scan tasks with thread-safe `ScanProgressState` (`phase`, `current_file`, `last_error`).
 - Thumbnail generation (Pillow) and static file streaming for full-resolution viewing.
-- Dev-only routes: `POST /api/dev/reset-library`, `POST /api/dev/simulate-scan`.
+- Dev-only routes (require `PHOTO_ORGANIZER_DEV=1` on the sidecar): `POST /api/dev/reset-library`, `POST /api/dev/simulate-scan`. Unset in release builds — routes return 404.
 
 ### Phase 4 — Desktop shell (Tauri 2 + React)
 
@@ -267,8 +267,8 @@ Base URL: **`http://127.0.0.1:8000`**. The React client is implemented in `src/s
 | `GET` | `/api/clusters/{id}/thumbnail` | Cluster representative thumbnail (full frame) |
 | `GET` | `/api/faces/{id}/thumbnail` | Face thumbnail; add `?crop=1` for bbox-centered crop |
 | `GET` | `/api/people/{id}/thumbnail` | Person avatar thumbnail |
-| `POST` | `/api/dev/reset-library` | Clear ingestion data (dev) |
-| `POST` | `/api/dev/simulate-scan` | Scan a test folder (dev) |
+| `POST` | `/api/dev/reset-library` | Clear ingestion data (**dev only**, `PHOTO_ORGANIZER_DEV=1`) |
+| `POST` | `/api/dev/simulate-scan` | Scan a test folder (**dev only**) |
 
 **Naming rule:** There is no `/api/people/name` route. Assigning display names always goes through **`POST /api/clusters/identify`** with `{ cluster_id, name }` or `{ face_id, name | person_id }`.
 
@@ -530,8 +530,8 @@ Bazowy URL: **`http://127.0.0.1:8000`**. Klient: `src/services/api.ts`.
 | `GET` | `/api/clusters/{id}/thumbnail` | Miniatura klastra |
 | `GET` | `/api/faces/{id}/thumbnail` | Miniatura twarzy |
 | `GET` | `/api/people/{id}/thumbnail` | Awatar osoby |
-| `POST` | `/api/dev/reset-library` | Reset danych (dev) |
-| `POST` | `/api/dev/simulate-scan` | Testowy skan (dev) |
+| `POST` | `/api/dev/reset-library` | Reset danych (**tylko dev**, `PHOTO_ORGANIZER_DEV=1`) |
+| `POST` | `/api/dev/simulate-scan` | Testowy skan (**tylko dev**) |
 
 **Ważne:** Nie ma endpointu `/api/people/name` — nazwy zawsze przez **`POST /api/clusters/identify`**.
 

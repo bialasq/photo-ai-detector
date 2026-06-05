@@ -6,7 +6,7 @@
 //! |------|-----------------------------------|-----------------|
 //! | **Production** (`tauri build`) | unset | Bundled PyInstaller sidecar `photo-ai-backend` from `bundle.externalBin` |
 //! | **`run_app.bat` / manual uvicorn** | `1` / `true` / `yes` | No spawn — UI talks to an already-running server on port 8000 |
-//! | **Dev** (`tauri dev`) | unset | PyInstaller sidecar if `binaries/photo-ai-backend-{triple}` is present (≥10 MB); else `venv/Scripts/python.exe main.py` |
+//! | **Dev** (`tauri dev`) | unset | PyInstaller sidecar if `binaries/photo-ai-backend-{triple}` is present (≥10 MB); else `venv/Scripts/python.exe main.py`. Debug builds set `PHOTO_ORGANIZER_DEV=1` on the child process. |
 //!
 //! On startup (`setup`), when external backend is **not** requested, Rust spawns the native
 //! sidecar and stores the child handle. On main-window close or app exit, `shutdown_backend`
@@ -32,6 +32,9 @@ const TAURI_CRATE_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
 /// PyInstaller `photo-ai-backend` is hundreds of MB; the Rust dev launcher stub is ~250 KB.
 const MIN_PYINSTALLER_SIDECAR_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Environment variable that enables `/api/dev/*` on the Python sidecar (must be `"1"`).
+const DEV_MODE_ENV: &str = "PHOTO_ORGANIZER_DEV";
 
 /// Child process spawned by this app (sidecar or dev python). `None` when using an external server.
 struct BackendProcessState(Mutex<Option<CommandChild>>);
@@ -270,6 +273,28 @@ fn sidecar_working_directory(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// Apply shared sidecar environment. ``PHOTO_ORGANIZER_DEV=1`` is injected only in debug builds
+/// so release MSI installs never expose developer HTTP routes.
+fn apply_sidecar_env(
+    command: tauri_plugin_shell::process::Command,
+) -> tauri_plugin_shell::process::Command {
+    let command = command
+        .env("PHOTO_ORGANIZER_HOST", BACKEND_HOST)
+        .env("PHOTO_ORGANIZER_PORT", BACKEND_PORT)
+        .env("PYTHONNOUSERSITE", "1");
+
+    #[cfg(debug_assertions)]
+    {
+        log::info!(
+            "Debug build: setting {DEV_MODE_ENV}=1 on sidecar (dev HTTP routes enabled)"
+        );
+        return command.env(DEV_MODE_ENV, "1");
+    }
+
+    #[cfg(not(debug_assertions))]
+    command
+}
+
 fn spawn_packaged_sidecar(
     app: &AppHandle,
 ) -> Result<(Receiver<CommandEvent>, CommandChild), String> {
@@ -292,11 +317,8 @@ fn spawn_packaged_sidecar(
             )
         })?;
 
-    command
-        .env("PHOTO_ORGANIZER_HOST", BACKEND_HOST)
-        .env("PHOTO_ORGANIZER_PORT", BACKEND_PORT)
+    apply_sidecar_env(command)
         .env("PHOTO_AI_PROJECT_ROOT", project_root.display().to_string())
-        .env("PYTHONNOUSERSITE", "1")
         .current_dir(&work_dir)
         .spawn()
         .map_err(|err| format!("sidecar '{SIDECAR_NAME}' spawn failed: {err}"))
@@ -350,16 +372,15 @@ fn spawn_dev_python_backend(
         project_root.display()
     );
 
-    app.shell()
-        .command(python)
-        .args(["main.py"])
-        .current_dir(&project_root)
-        .env("PHOTO_ORGANIZER_HOST", BACKEND_HOST)
-        .env("PHOTO_ORGANIZER_PORT", BACKEND_PORT)
-        .env("PHOTO_AI_PROJECT_ROOT", project_root.display().to_string())
-        .env("PYTHONNOUSERSITE", "1")
-        .spawn()
-        .map_err(|err| format!("dev python spawn failed: {err}"))
+    apply_sidecar_env(
+        app.shell()
+            .command(python)
+            .args(["main.py"])
+            .current_dir(&project_root)
+            .env("PHOTO_AI_PROJECT_ROOT", project_root.display().to_string()),
+    )
+    .spawn()
+    .map_err(|err| format!("dev python spawn failed: {err}"))
 }
 
 async fn monitor_backend_output(rx: &mut Receiver<CommandEvent>) {
