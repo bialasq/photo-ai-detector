@@ -1,0 +1,1855 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Photo Organizer Sidecar API",
+    "description": "Local-only FastAPI sidecar for the offline photo organizer. Wraps database.py and ai_core.py for Tauri desktop integration.",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "Health check for Tauri sidecar readiness probes",
+        "description": "Simple liveness endpoint (no auth — localhost only).",
+        "operationId": "health_check_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object",
+                  "title": "Response Health Check Health Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/scan-folder": {
+      "post": {
+        "tags": [
+          "scan"
+        ],
+        "summary": "Start background folder ingestion + clustering",
+        "description": "Recursively scan a local folder for JPG/PNG images.\n\nHeavy AI work runs in a background asyncio task using worker threads so this\nendpoint returns immediately with `{ \"status\": \"started\", \"total_files\": N }`.",
+        "operationId": "post_scan_folder_api_scan_folder_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScanFolderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScanFolderResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/scan-status": {
+      "get": {
+        "tags": [
+          "scan"
+        ],
+        "summary": "Poll background scan progress",
+        "description": "Return live scanning metrics from the thread-safe global state object.\n\nFrontend should poll this endpoint while `is_active` is true.",
+        "operationId": "get_scan_status_api_scan_status_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScanStatusResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/search": {
+      "get": {
+        "tags": [
+          "search"
+        ],
+        "summary": "Search photos containing ALL named people (intersection)",
+        "description": "Strict relational intersection search via DatabaseManager.get_photos_by_names.\n\nOnly photos where EVERY listed person appears together are returned.",
+        "operationId": "get_search_api_search_get",
+        "parameters": [
+          {
+            "name": "names",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Comma-separated person names (AND / intersection). Example: Magda,Łukasz",
+              "examples": [
+                "Magda,Łukasz"
+              ],
+              "title": "Names"
+            },
+            "description": "Comma-separated person names (AND / intersection). Example: Magda,Łukasz"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SearchResultItem"
+                  },
+                  "title": "Response Get Search Api Search Get"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/gallery": {
+      "get": {
+        "tags": [
+          "gallery"
+        ],
+        "summary": "List photos with optional person intersection and AI processed filters",
+        "description": "Gallery listing for the desktop UI.\n\nWhen person_ids is omitted or empty, returns all photos (subject to ai_status).\nWhen one person_id is set, returns every photo that contains that person (group shots included).\nWhen multiple person_ids are set, returns photos where every listed person appears together.",
+        "operationId": "get_gallery_api_gallery_get",
+        "parameters": [
+          {
+            "name": "person_ids",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "Comma-separated people.id values (AND / intersection). Empty = no person filter.",
+              "examples": [
+                "1,2"
+              ],
+              "default": "",
+              "title": "Person Ids"
+            },
+            "description": "Comma-separated people.id values (AND / intersection). Empty = no person filter."
+          },
+          {
+            "name": "ai_status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "Filter by ingestion status: all | processed | unprocessed | faceless.",
+              "examples": [
+                "processed"
+              ],
+              "default": "all",
+              "title": "Ai Status"
+            },
+            "description": "Filter by ingestion status: all | processed | unprocessed | faceless."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SearchResultItem"
+                  },
+                  "title": "Response Get Gallery Api Gallery Get"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/clusters/unnamed": {
+      "get": {
+        "tags": [
+          "clusters"
+        ],
+        "summary": "List unnamed DBSCAN clusters with exemplar face geometry",
+        "description": "Return unnamed clusters with bounding boxes for face-centered UI thumbnails.\n\nDBSCAN noise faces (cluster_id NULL) are excluded by the database layer.",
+        "operationId": "get_unnamed_clusters_api_clusters_unnamed_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/UnnamedClusterSummaryItem"
+                  },
+                  "type": "array",
+                  "title": "Response Get Unnamed Clusters Api Clusters Unnamed Get"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/clusters/noise": {
+      "get": {
+        "tags": [
+          "clusters"
+        ],
+        "summary": "List DBSCAN noise faces awaiting manual assignment",
+        "description": "Return unassigned faces with no named cluster (``cluster_id IS NULL`` or ``< 0``).\n\nThumbnail URLs point at the parent photo preview for each detection.",
+        "operationId": "get_noise_faces_api_clusters_noise_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/NoiseFaceItem"
+                  },
+                  "type": "array",
+                  "title": "Response Get Noise Faces Api Clusters Noise Get"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/clusters/identify": {
+      "post": {
+        "tags": [
+          "clusters"
+        ],
+        "summary": "Assign a display name to an unnamed DBSCAN cluster",
+        "description": "Name a DBSCAN cluster or assign a single noise face to a new/existing person.",
+        "operationId": "post_identify_cluster_api_clusters_identify_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IdentifyClusterRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IdentifyClusterResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/people/merge": {
+      "post": {
+        "tags": [
+          "people"
+        ],
+        "summary": "Merge two person records into one identity",
+        "description": "Reassign all faces from `source_person_id` to `target_person_id` and delete the source.\n\nUses DatabaseManager.merge_person_clusters(target_person_id, source_person_id).",
+        "operationId": "post_merge_people_api_people_merge_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MergePeopleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergePeopleResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/people": {
+      "get": {
+        "tags": [
+          "people"
+        ],
+        "summary": "List all identified people with face counts and exemplar photos",
+        "description": "Return every person row with aggregate statistics for the UI gallery.\n\nUses DatabaseManager.get_all_people_with_face_counts().",
+        "operationId": "get_people_api_people_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/PersonSummaryItem"
+                  },
+                  "type": "array",
+                  "title": "Response Get People Api People Get"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/people/{person_id}/thumbnail": {
+      "get": {
+        "tags": [
+          "people"
+        ],
+        "summary": "Serve a JPEG thumbnail for a person's exemplar photo",
+        "description": "Resolve the lowest linked face for the person to a photo, then stream its thumbnail.",
+        "operationId": "get_person_thumbnail_api_people__person_id__thumbnail_get",
+        "parameters": [
+          {
+            "name": "person_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Person Id"
+            }
+          },
+          {
+            "name": "width",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 4096,
+              "minimum": 1,
+              "description": "Maximum thumbnail width in pixels.",
+              "default": 300,
+              "title": "Width"
+            },
+            "description": "Maximum thumbnail width in pixels."
+          },
+          {
+            "name": "height",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "maximum": 4096,
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional maximum height; aspect ratio preserved when omitted.",
+              "title": "Height"
+            },
+            "description": "Optional maximum height; aspect ratio preserved when omitted."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/photos/{photo_id}/thumbnail": {
+      "get": {
+        "tags": [
+          "photos"
+        ],
+        "summary": "Serve a cached JPEG thumbnail for a photo",
+        "description": "Stream a downscaled JPEG thumbnail from `.thumbnail_cache/`.\n\nOn cache miss the image is resized with Pillow (LANCZOS) and stored as JPEG quality 85.",
+        "operationId": "get_photo_thumbnail_api_photos__photo_id__thumbnail_get",
+        "parameters": [
+          {
+            "name": "photo_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Photo Id"
+            }
+          },
+          {
+            "name": "width",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 4096,
+              "minimum": 1,
+              "description": "Maximum thumbnail width in pixels.",
+              "default": 300,
+              "title": "Width"
+            },
+            "description": "Maximum thumbnail width in pixels."
+          },
+          {
+            "name": "height",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "maximum": 4096,
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional maximum height; aspect ratio preserved when omitted.",
+              "title": "Height"
+            },
+            "description": "Optional maximum height; aspect ratio preserved when omitted."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/photos/{photo_id}/file": {
+      "get": {
+        "tags": [
+          "photos"
+        ],
+        "summary": "Stream the original photo file from disk",
+        "description": "Return the full-resolution source image for gallery lightbox viewing.",
+        "operationId": "get_photo_file_api_photos__photo_id__file_get",
+        "parameters": [
+          {
+            "name": "photo_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Photo Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/clusters/{cluster_id}/photos": {
+      "get": {
+        "tags": [
+          "clusters"
+        ],
+        "summary": "List every photo containing at least one face in the cluster",
+        "description": "Return all images where any detected face belongs to ``cluster_id``.\n\nMulti-face photos are included when at least one face matches; other faces in the\nsame image are ignored for filtering purposes.",
+        "operationId": "get_cluster_photos_api_clusters__cluster_id__photos_get",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Cluster Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SearchResultItem"
+                  },
+                  "title": "Response Get Cluster Photos Api Clusters  Cluster Id  Photos Get"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/clusters/{cluster_id}/thumbnail": {
+      "get": {
+        "tags": [
+          "clusters"
+        ],
+        "summary": "Serve a JPEG thumbnail for an unnamed cluster exemplar photo",
+        "description": "Resolve the lowest unassigned face in the cluster to a photo, then stream its thumbnail.",
+        "operationId": "get_cluster_thumbnail_api_clusters__cluster_id__thumbnail_get",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Cluster Id"
+            }
+          },
+          {
+            "name": "width",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 4096,
+              "minimum": 1,
+              "description": "Maximum thumbnail width in pixels.",
+              "default": 300,
+              "title": "Width"
+            },
+            "description": "Maximum thumbnail width in pixels."
+          },
+          {
+            "name": "height",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "maximum": 4096,
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional maximum height; aspect ratio preserved when omitted.",
+              "title": "Height"
+            },
+            "description": "Optional maximum height; aspect ratio preserved when omitted."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/faces/{face_id}/thumbnail": {
+      "get": {
+        "tags": [
+          "faces"
+        ],
+        "summary": "Serve a JPEG thumbnail for a face's source photo (Noise Inspector)",
+        "description": "Stream a JPEG thumbnail for this face (full photo or face-centered crop).",
+        "operationId": "get_face_thumbnail_api_faces__face_id__thumbnail_get",
+        "parameters": [
+          {
+            "name": "face_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Face Id"
+            }
+          },
+          {
+            "name": "width",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 4096,
+              "minimum": 1,
+              "description": "Maximum thumbnail width in pixels.",
+              "default": 300,
+              "title": "Width"
+            },
+            "description": "Maximum thumbnail width in pixels."
+          },
+          {
+            "name": "height",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "maximum": 4096,
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional maximum thumbnail height in pixels.",
+              "title": "Height"
+            },
+            "description": "Optional maximum thumbnail height in pixels."
+          },
+          {
+            "name": "crop",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "When true, crop to the face bounding box before resizing.",
+              "default": false,
+              "title": "Crop"
+            },
+            "description": "When true, crop to the face bounding box before resizing."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/dev/reset-library": {
+      "post": {
+        "tags": [
+          "dev"
+        ],
+        "summary": "[Dev] Wipe photos, faces, and people tables",
+        "description": "Developer helper: clear ingestion tables (localhost sidecar only).",
+        "operationId": "dev_reset_library_api_dev_reset_library_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DevResetLibraryResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/dev/simulate-scan": {
+      "post": {
+        "tags": [
+          "dev"
+        ],
+        "summary": "[Dev] Optionally reset DB and scan PHOTO_ORGANIZER_DEV_SCAN_FOLDER",
+        "description": "Developer helper to exercise scan progress UI against a fixed folder.",
+        "operationId": "dev_simulate_scan_api_dev_simulate_scan_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DevSimulateScanRequest",
+                "default": {
+                  "reset_first": true
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScanFolderResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "BoundingBoxModel": {
+        "properties": {
+          "x": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "X"
+          },
+          "y": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Y"
+          },
+          "w": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "W"
+          },
+          "h": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "H"
+          }
+        },
+        "type": "object",
+        "required": [
+          "x",
+          "y",
+          "w",
+          "h"
+        ],
+        "title": "BoundingBoxModel",
+        "description": "Pixel bounding box stored in faces.bounding_box JSON (x, y, w, h)."
+      },
+      "DevResetLibraryResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status",
+            "default": "ok"
+          },
+          "removed": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Removed"
+          }
+        },
+        "type": "object",
+        "title": "DevResetLibraryResponse",
+        "description": "Response for POST /api/dev/reset-library."
+      },
+      "DevSimulateScanRequest": {
+        "properties": {
+          "folder_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Folder Path",
+            "description": "Override dev scan folder (default: PHOTO_ORGANIZER_DEV_SCAN_FOLDER)."
+          },
+          "reset_first": {
+            "type": "boolean",
+            "title": "Reset First",
+            "description": "When true, wipe photos/faces/people before starting the scan.",
+            "default": true
+          }
+        },
+        "type": "object",
+        "title": "DevSimulateScanRequest",
+        "description": "Optional body for POST /api/dev/simulate-scan."
+      },
+      "ErrorCode": {
+        "type": "string",
+        "enum": [
+          "AI_CORE_FAILURE",
+          "DB_LOCKED",
+          "PATH_INVALID",
+          "VALIDATION_ERROR",
+          "NOT_FOUND",
+          "INTERNAL_ERROR",
+          "SCAN_IN_PROGRESS",
+          "SCAN_CANCELLED"
+        ],
+        "title": "ErrorCode",
+        "description": "Stable machine-readable error codes returned in ``ErrorResponse.code``."
+      },
+      "ErrorResponse": {
+        "properties": {
+          "error": {
+            "type": "string",
+            "title": "Error",
+            "description": "Human-readable error message."
+          },
+          "code": {
+            "$ref": "#/components/schemas/ErrorCode",
+            "description": "Stable machine-readable error code."
+          },
+          "hint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hint",
+            "description": "Optional user-facing guidance (safe to show in the UI)."
+          },
+          "details": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Details",
+            "description": "Optional structured context (never contains stack traces)."
+          }
+        },
+        "type": "object",
+        "required": [
+          "error",
+          "code"
+        ],
+        "title": "ErrorResponse",
+        "description": "Standard error payload for all API failure responses."
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "IdentifyClusterRequest": {
+        "properties": {
+          "cluster_id": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cluster Id",
+            "description": "DBSCAN cluster label (>= 0) for batch naming."
+          },
+          "face_id": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Face Id",
+            "description": "Single noise face id (cluster_id IS NULL) for Noise Inspector."
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name",
+            "description": "Display name for a new profile (cluster or noise face)."
+          },
+          "person_id": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Person Id",
+            "description": "Existing people.id when assigning a noise face to a named profile."
+          }
+        },
+        "type": "object",
+        "title": "IdentifyClusterRequest",
+        "description": "Body for POST /api/clusters/identify (cluster batch or single noise face)."
+      },
+      "IdentifyClusterResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status",
+            "description": "Operation outcome indicator.",
+            "default": "success"
+          },
+          "person_id": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Person Id",
+            "description": "Assigned or created people.id."
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Name",
+            "description": "Assigned display name."
+          },
+          "cluster_id": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cluster Id",
+            "description": "Cluster labeled when cluster_id was provided."
+          },
+          "face_id": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Face Id",
+            "description": "Noise face removed from the inspector when face_id was provided."
+          }
+        },
+        "type": "object",
+        "required": [
+          "person_id",
+          "name"
+        ],
+        "title": "IdentifyClusterResponse",
+        "description": "Response for POST /api/clusters/identify."
+      },
+      "MergePeopleRequest": {
+        "properties": {
+          "target_person_id": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Target Person Id",
+            "description": "Person record that survives the merge."
+          },
+          "source_person_id": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Source Person Id",
+            "description": "Person record removed after faces are reassigned."
+          }
+        },
+        "type": "object",
+        "required": [
+          "target_person_id",
+          "source_person_id"
+        ],
+        "title": "MergePeopleRequest",
+        "description": "Body for POST /api/people/merge."
+      },
+      "MergePeopleResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status",
+            "description": "Operation outcome indicator.",
+            "default": "success"
+          },
+          "target_person_id": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Target Person Id"
+          },
+          "source_person_id": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Source Person Id"
+          },
+          "faces_moved": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Faces Moved",
+            "description": "Number of face rows reassigned from source to target."
+          }
+        },
+        "type": "object",
+        "required": [
+          "target_person_id",
+          "source_person_id",
+          "faces_moved"
+        ],
+        "title": "MergePeopleResponse",
+        "description": "Response for POST /api/people/merge."
+      },
+      "NoiseFaceItem": {
+        "properties": {
+          "face_id": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Face Id"
+          },
+          "photo_id": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Photo Id"
+          },
+          "bounding_box": {
+            "$ref": "#/components/schemas/BoundingBoxModel"
+          },
+          "thumbnail_url": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Thumbnail Url",
+            "description": "Relative URL to a JPEG thumbnail for this face's source photo."
+          }
+        },
+        "type": "object",
+        "required": [
+          "face_id",
+          "photo_id",
+          "bounding_box",
+          "thumbnail_url"
+        ],
+        "title": "NoiseFaceItem",
+        "description": "One DBSCAN noise face for the Noise Inspector UI."
+      },
+      "PersonSummaryItem": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Id",
+            "description": "people.id primary key."
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name",
+            "description": "Assigned display name, or null if not yet named."
+          },
+          "face_count": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Face Count",
+            "description": "Total faces linked to this person."
+          },
+          "exemplar_photo_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exemplar Photo Path",
+            "description": "Filesystem path of one representative photo for UI thumbnails."
+          },
+          "exemplar_face_id": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exemplar Face Id",
+            "description": "Representative face id for cropped thumbnails."
+          },
+          "bounding_box": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BoundingBoxModel"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Bounding box of the exemplar face in pixel coordinates."
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "face_count"
+        ],
+        "title": "PersonSummaryItem",
+        "description": "One identified person returned by GET /api/people."
+      },
+      "ScanFolderRequest": {
+        "properties": {
+          "folder_path": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Folder Path",
+            "description": "Absolute or relative path to a local directory to scan recursively.",
+            "examples": [
+              "C:\\Users\\Photos\\Vacation2024"
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "folder_path"
+        ],
+        "title": "ScanFolderRequest",
+        "description": "Body for POST /api/scan-folder."
+      },
+      "ScanFolderResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status",
+            "description": "Always 'started' when the background worker launches."
+          },
+          "total_files": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Total Files",
+            "description": "Number of image files queued for ingestion."
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "total_files"
+        ],
+        "title": "ScanFolderResponse",
+        "description": "Response for POST /api/scan-folder."
+      },
+      "ScanStatusResponse": {
+        "properties": {
+          "processed": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Processed",
+            "description": "Files fully ingested so far."
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Total",
+            "description": "Total files discovered for this scan run."
+          },
+          "is_active": {
+            "type": "boolean",
+            "title": "Is Active",
+            "description": "True while the background worker is running."
+          },
+          "phase": {
+            "type": "string",
+            "title": "Phase",
+            "description": "Worker phase: idle | scanning | clustering.",
+            "default": "idle"
+          },
+          "current_file": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current File",
+            "description": "Basename of the image currently being ingested, if any."
+          },
+          "last_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error",
+            "description": "Most recent per-file or clustering error message, if any."
+          }
+        },
+        "type": "object",
+        "required": [
+          "processed",
+          "total",
+          "is_active"
+        ],
+        "title": "ScanStatusResponse",
+        "description": "Response for GET /api/scan-status."
+      },
+      "SearchResultItem": {
+        "properties": {
+          "photo_id": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Photo Id"
+          },
+          "file_path": {
+            "type": "string",
+            "minLength": 1,
+            "title": "File Path"
+          }
+        },
+        "type": "object",
+        "required": [
+          "photo_id",
+          "file_path"
+        ],
+        "title": "SearchResultItem",
+        "description": "One photo returned by GET /api/search."
+      },
+      "UnnamedClusterSummaryItem": {
+        "properties": {
+          "cluster_id": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Cluster Id"
+          },
+          "exemplar_face_id": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Exemplar Face Id"
+          },
+          "photo_id": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Photo Id"
+          },
+          "bounding_box": {
+            "$ref": "#/components/schemas/BoundingBoxModel"
+          },
+          "face_count": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Face Count"
+          },
+          "thumbnail_url": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Thumbnail Url"
+          }
+        },
+        "type": "object",
+        "required": [
+          "cluster_id",
+          "exemplar_face_id",
+          "photo_id",
+          "bounding_box",
+          "face_count",
+          "thumbnail_url"
+        ],
+        "title": "UnnamedClusterSummaryItem",
+        "description": "Unnamed DBSCAN cluster with exemplar face geometry for the People UI."
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}

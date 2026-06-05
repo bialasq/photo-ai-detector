@@ -101,6 +101,8 @@ PROJECT_ROOT: Final[Path] = _resolve_project_root()
 DEFAULT_HOST: Final[str] = "127.0.0.1"
 DEFAULT_PORT: Final[int] = 8000
 
+LOOPBACK_BIND_HOSTS: Final[frozenset[str]] = frozenset({"127.0.0.1", "localhost", "::1"})
+
 API_PREFIX: Final[str] = "/api"
 
 DEV_SCAN_FOLDER: Final[str] = os.environ.get(
@@ -1581,8 +1583,28 @@ async def lifespan(application: FastAPI):
     _services = None
 
 
+def assert_loopback_bind_host(host: str) -> str:
+    """
+    Validate that the sidecar binds only to a loopback interface.
+
+    Returns the normalized host string passed to Uvicorn (``localhost`` → ``127.0.0.1``).
+    """
+    normalized = host.strip().lower()
+    if not normalized:
+        raise ValueError("Bind host must not be empty")
+    if normalized not in LOOPBACK_BIND_HOSTS:
+        raise ValueError(
+            f"Sidecar must bind to loopback only, got {host!r}. "
+            f"Allowed: {sorted(LOOPBACK_BIND_HOSTS)}"
+        )
+    if normalized == "localhost":
+        return "127.0.0.1"
+    return normalized
+
+
 def create_application(*, dev_mode: bool | None = None) -> FastAPI:
     """Build and configure the FastAPI application instance."""
+    docs_enabled = is_dev_mode(override=dev_mode)
     application = FastAPI(
         title="Photo Organizer Sidecar API",
         description=(
@@ -1591,8 +1613,9 @@ def create_application(*, dev_mode: bool | None = None) -> FastAPI:
         ),
         version="1.0.0",
         lifespan=lifespan,
-        docs_url="/docs",
-        redoc_url="/redoc",
+        docs_url="/docs" if docs_enabled else None,
+        redoc_url="/redoc" if docs_enabled else None,
+        openapi_url="/openapi.json" if docs_enabled else None,
     )
 
     application.add_middleware(
@@ -2464,11 +2487,12 @@ def run_server(
 
     Binds only to loopback interface — not exposed to the LAN.
     """
+    bind_host = assert_loopback_bind_host(host)
     setup_logging(level=log_level.upper())
-    LOGGER.info("Launching Uvicorn on http://%s:%s", host, port)
+    LOGGER.info("Listening on %s:%s (loopback-only)", bind_host, port)
     uvicorn.run(
         app,
-        host=host,
+        host=bind_host,
         port=port,
         log_level=log_level,
         access_log=True,
