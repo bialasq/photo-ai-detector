@@ -1474,17 +1474,36 @@ def ingest_image_to_database(
 
     photo_id = database.insert_photo(path)
 
-    detections = ai_engine.process_image(path)
-    face_ids: list[int] = []
+    try:
+        detections = ai_engine.process_image(path)
+        face_ids: list[int] = []
 
-    for detection in detections:
-        face_id = database.insert_face(
-            photo_id=photo_id,
-            embedding=detection["embedding"],
-            bounding_box=detection["bounding_box"],
-            enforce_embedding_dimension=True,
+        for detection in detections:
+            face_id = database.insert_face(
+                photo_id=photo_id,
+                embedding=detection["embedding"],
+                bounding_box=detection["bounding_box"],
+                enforce_embedding_dimension=True,
+            )
+            face_ids.append(face_id)
+    except AICoreError as exc:
+        LOGGER.warning(
+            "skipping %s: %s: %s",
+            path,
+            type(exc).__name__,
+            exc,
+            extra={"path": path, "error_type": type(exc).__name__},
         )
-        face_ids.append(face_id)
+        if mark_processed:
+            database.mark_photo_as_processed(photo_id, has_faces=False)
+        return {
+            "photo_id": photo_id,
+            "file_path": path,
+            "face_ids": [],
+            "detection_count": 0,
+            "skipped": True,
+            "faceless": True,
+        }
 
     if mark_processed:
         database.mark_photo_as_processed(photo_id, has_faces=bool(face_ids))
