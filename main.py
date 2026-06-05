@@ -42,13 +42,22 @@ from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from PIL import Image, UnidentifiedImageError
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field
+
+from routes.v1 import router as v1_router
+from schemas import (
+    DevSimulateScanRequest,
+    IdentifyClusterRequest,
+    MergePeopleRequest,
+    ScanFolderRequest,
+)
 
 from ai_core import (
     AICoreError,
     AICoreEngine,
     ClusteringEngine,
     ClusteringError,
+    DEFAULT_DETECTION_BATCH_SIZE,
     FaceDetectionError,
     FaceInsertBuffer,
     ingest_image_to_database,
@@ -175,27 +184,8 @@ AI_THREAD_POOL_WORKERS: Final[int] = 1
 
 
 # ---------------------------------------------------------------------------
-# Pydantic request / response models (OpenAPI + validation)
+# Pydantic response models (OpenAPI + validation)
 # ---------------------------------------------------------------------------
-
-
-class ScanFolderRequest(BaseModel):
-    """Body for POST /api/scan-folder."""
-
-    folder_path: str = Field(
-        ...,
-        min_length=1,
-        description="Absolute or relative path to a local directory to scan recursively.",
-        examples=[r"C:\Users\Photos\Vacation2024"],
-    )
-
-    @field_validator("folder_path")
-    @classmethod
-    def strip_folder_path(cls, value: str) -> str:
-        stripped = value.strip()
-        if not stripped:
-            raise ValueError("folder_path must not be empty or whitespace")
-        return stripped
 
 
 class ScanFolderResponse(BaseModel):
@@ -278,66 +268,6 @@ class NoiseFaceItem(BaseModel):
     )
 
 
-class IdentifyClusterRequest(BaseModel):
-    """Body for POST /api/clusters/identify (cluster batch or single noise face)."""
-
-    cluster_id: Optional[int] = Field(
-        default=None,
-        ge=0,
-        description="DBSCAN cluster label (>= 0) for batch naming.",
-    )
-    face_id: Optional[int] = Field(
-        default=None,
-        ge=1,
-        description="Single noise face id (cluster_id IS NULL) for Noise Inspector.",
-    )
-    name: Optional[str] = Field(
-        default=None,
-        min_length=1,
-        description="Display name for a new profile (cluster or noise face).",
-    )
-    person_id: Optional[int] = Field(
-        default=None,
-        ge=1,
-        description="Existing people.id when assigning a noise face to a named profile.",
-    )
-
-    @field_validator("name")
-    @classmethod
-    def strip_name(cls, value: Optional[str]) -> Optional[str]:
-        if value is None:
-            return None
-        stripped = value.strip()
-        if not stripped:
-            raise ValueError("name must not be empty or whitespace")
-        return stripped
-
-    @model_validator(mode="after")
-    def validate_identify_target(self) -> IdentifyClusterRequest:
-        has_cluster = self.cluster_id is not None
-        has_face = self.face_id is not None
-
-        if has_cluster == has_face:
-            raise ValueError("Provide exactly one of cluster_id or face_id")
-
-        if has_face:
-            if self.person_id is not None:
-                if self.name is not None:
-                    raise ValueError(
-                        "Provide person_id or name for face_id, not both"
-                    )
-                return self
-            if self.name is None:
-                raise ValueError("name is required when person_id is omitted for face_id")
-            return self
-
-        if self.person_id is not None:
-            raise ValueError("person_id is only valid with face_id")
-        if self.name is None:
-            raise ValueError("name is required when cluster_id is provided")
-        return self
-
-
 class IdentifyClusterResponse(BaseModel):
     """Response for POST /api/clusters/identify."""
 
@@ -361,40 +291,6 @@ class DevResetLibraryResponse(BaseModel):
 
     status: str = Field(default="ok")
     removed: dict[str, int] = Field(default_factory=dict)
-
-
-class DevSimulateScanRequest(BaseModel):
-    """Optional body for POST /api/dev/simulate-scan."""
-
-    folder_path: Optional[str] = Field(
-        default=None,
-        description="Override dev scan folder (default: PHOTO_ORGANIZER_DEV_SCAN_FOLDER).",
-    )
-    reset_first: bool = Field(
-        default=True,
-        description="When true, wipe photos/faces/people before starting the scan.",
-    )
-
-
-class MergePeopleRequest(BaseModel):
-    """Body for POST /api/people/merge."""
-
-    target_person_id: int = Field(
-        ...,
-        ge=1,
-        description="Person record that survives the merge.",
-    )
-    source_person_id: int = Field(
-        ...,
-        ge=1,
-        description="Person record removed after faces are reassigned.",
-    )
-
-    @model_validator(mode="after")
-    def validate_distinct_person_ids(self) -> MergePeopleRequest:
-        if self.target_person_id == self.source_person_id:
-            raise ValueError("source_person_id must differ from target_person_id")
-        return self
 
 
 class MergePeopleResponse(BaseModel):
@@ -496,9 +392,11 @@ class ScanProgressState:
         with self._lock:
             self.total = total_files
 
-    def increment_processed(self) -> None:
+    def increment_processed(self, count: int = 1) -> None:
+        if count <= 0:
+            return
         with self._lock:
-            self.processed += 1
+            self.processed += count
 
     def set_current_file(self, file_path: Optional[str]) -> None:
         with self._lock:
@@ -1291,6 +1189,7 @@ def _ingest_single_image_sync(
     services: AppServices,
     image_path: Path,
     face_buffer: FaceInsertBuffer | None = None,
+    detections: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
     Synchronous wrapper executed inside `asyncio.to_thread`.
@@ -1303,7 +1202,34 @@ def _ingest_single_image_sync(
         file_path=str(image_path),
         mark_processed=True,
         face_buffer=face_buffer,
+        detections=detections,
     )
+
+
+def _ingest_detection_batch_sync(
+    services: AppServices,
+    image_paths: list[Path],
+    face_buffer: FaceInsertBuffer,
+) -> None:
+    """Run batched detection then persist each image (task 2.1.1)."""
+    if not image_paths:
+        return
+
+    detection_results = services.ai_engine.detect_faces_batch_with_retry(
+        image_paths,
+        batch_size=DEFAULT_DETECTION_BATCH_SIZE,
+    )
+    for image_path, detections in zip(image_paths, detection_results, strict=True):
+        if _photo_already_ingested(services.database, image_path):
+            continue
+        ingest_image_to_database(
+            ai_engine=services.ai_engine,
+            database=services.database,
+            file_path=str(image_path),
+            mark_processed=True,
+            face_buffer=face_buffer,
+            detections=detections,
+        )
 
 
 def _run_clustering_sync(services: AppServices) -> None:
@@ -1348,6 +1274,8 @@ async def _execute_folder_scan_async(
     )
 
     try:
+        pending_batch: list[Path] = []
+
         for index, image_path in enumerate(image_files, start=1):
             scan_state.set_current_file(str(image_path))
             resolved_path = _resolve_ingestion_file_path(image_path)
@@ -1367,44 +1295,58 @@ async def _execute_folder_scan_async(
                 scan_state.increment_processed()
                 continue
 
+            pending_batch.append(image_path)
+            if len(pending_batch) < DEFAULT_DETECTION_BATCH_SIZE and index < len(image_files):
+                continue
+
+            batch_paths = list(pending_batch)
+            pending_batch.clear()
+
             try:
-                summary = await asyncio.to_thread(
-                    _ingest_single_image_sync,
+                await asyncio.to_thread(
+                    _ingest_detection_batch_sync,
                     services,
-                    image_path,
+                    batch_paths,
                     face_buffer,
                 )
-                LOGGER.info(
-                    "Scan file processed",
-                    extra={
-                        "ctx": {
-                            "event": "scan.file.done",
-                            "index": index,
-                            "total": len(image_files),
-                            "path_hash": hash_path_for_log(resolved_path),
-                            "photo_id": summary.get("photo_id"),
-                            "faces": summary.get("detection_count"),
-                        }
-                    },
-                )
+                for batch_index, batch_path in enumerate(batch_paths):
+                    LOGGER.info(
+                        "Scan file processed",
+                        extra={
+                            "ctx": {
+                                "event": "scan.file.done",
+                                "index": index - len(batch_paths) + batch_index + 1,
+                                "total": len(image_files),
+                                "path_hash": hash_path_for_log(
+                                    _resolve_ingestion_file_path(batch_path)
+                                ),
+                            }
+                        },
+                    )
             except Exception as exc:  # noqa: BLE001 — continue scan; record last error
                 LOGGER.exception(
-                    "Failed to ingest file %s: %s: %s",
+                    "Failed to ingest batch ending at %s: %s: %s",
                     hash_path_for_log(image_path),
                     type(exc).__name__,
                     exc,
-                    extra={
-                        "ctx": {
-                            "event": "scan.file.error",
-                            "index": index,
-                            "total": len(image_files),
-                            "path_hash": hash_path_for_log(resolved_path),
-                        }
-                    },
                 )
                 scan_state.last_error = f"{image_path.name}: {exc}"
             finally:
-                scan_state.increment_processed()
+                scan_state.increment_processed(len(batch_paths))
+
+        if pending_batch:
+            try:
+                await asyncio.to_thread(
+                    _ingest_detection_batch_sync,
+                    services,
+                    pending_batch,
+                    face_buffer,
+                )
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.exception("Failed to ingest final batch: %s", exc)
+                scan_state.last_error = str(exc)
+            finally:
+                scan_state.increment_processed(len(pending_batch))
 
         await asyncio.to_thread(face_buffer.flush)
 
@@ -1551,6 +1493,11 @@ async def lifespan(application: FastAPI):
 
     database = DatabaseManager()
     database.create_tables()
+    try:
+        database.require_database_integrity()
+    except DatabaseError as exc:
+        LOGGER.error("Sidecar startup aborted: %s", exc)
+        raise SystemExit(1) from exc
 
     ai_engine = AICoreEngine()
     clustering = ClusteringEngine(database=database)
@@ -1638,6 +1585,7 @@ def create_application(*, dev_mode: bool | None = None) -> FastAPI:
     register_exception_handlers(application)
 
     register_routes(application, dev_mode=dev_mode)
+    application.include_router(v1_router)
     return application
 
 

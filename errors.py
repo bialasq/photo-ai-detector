@@ -166,12 +166,20 @@ async def validation_exception_handler(
     exc: RequestValidationError,
 ) -> JSONResponse:
     """Map FastAPI/Pydantic request validation failures to ``VALIDATION_ERROR``."""
+    sanitized_errors: list[dict[str, Any]] = []
+    for item in exc.errors():
+        entry = dict(item)
+        ctx = entry.get("ctx")
+        if isinstance(ctx, dict):
+            entry["ctx"] = {key: str(value) for key, value in ctx.items()}
+        sanitized_errors.append(entry)
+
     return _json_response(
         status.HTTP_422_UNPROCESSABLE_ENTITY,
         error_response_dict(
             error="Request validation failed",
             code=ErrorCode.VALIDATION_ERROR,
-            details={"errors": exc.errors()},
+            details={"errors": sanitized_errors},
         ),
     )
 

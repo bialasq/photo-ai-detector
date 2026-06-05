@@ -21,6 +21,7 @@ Pipeline overview:
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import math
 from dataclasses import dataclass, field
@@ -154,6 +155,12 @@ MIN_IMAGE_FILE_BYTES: Final[int] = 32
 SUPPORTED_IMAGE_SUFFIXES: Final[frozenset[str]] = frozenset(
     {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 )
+
+# DeepFace has no stable native batch API in our stack — ThreadPool, not ProcessPool
+# (TensorFlow + PyInstaller). See task 2.1.1 decision in docs/BENCHMARKS.md.
+DEFAULT_DETECTION_BATCH_SIZE: Final[int] = 32
+DETECTION_THREAD_WORKERS: Final[int] = 4
+MAX_DETECTION_BATCH_SIZE: Final[int] = 500
 
 
 # ---------------------------------------------------------------------------
@@ -880,6 +887,60 @@ class AICoreEngine:
             return []
 
 
+    def detect_faces_batch(
+        self,
+        image_paths: Sequence[str | Path],
+        *,
+        batch_size: int = DEFAULT_DETECTION_BATCH_SIZE,
+    ) -> list[list[dict[str, Any]]]:
+        """
+        Detect faces on multiple images using a thread pool.
+
+        DeepFace.represent does not accept a batched tensor in our pinned version;
+        concurrency comes from ``ThreadPoolExecutor`` over ``process_image`` calls.
+        """
+        if batch_size <= 0 or batch_size > MAX_DETECTION_BATCH_SIZE:
+            raise ValueError(
+                f"batch_size must be between 1 and {MAX_DETECTION_BATCH_SIZE}, got {batch_size}"
+            )
+
+        paths = [Path(path) for path in image_paths[:batch_size]]
+        if not paths:
+            return []
+
+        LOGGER.info(
+            "Batch face detection: images=%s workers=%s",
+            len(paths),
+            DETECTION_THREAD_WORKERS,
+        )
+
+        with ThreadPoolExecutor(max_workers=DETECTION_THREAD_WORKERS) as executor:
+            return list(executor.map(self.process_image, paths))
+
+    def detect_faces_batch_with_retry(
+        self,
+        image_paths: Sequence[str | Path],
+        *,
+        batch_size: int = DEFAULT_DETECTION_BATCH_SIZE,
+    ) -> list[list[dict[str, Any]]]:
+        """Run ``detect_faces_batch``; halve batch_size once on MemoryError."""
+        try:
+            return self.detect_faces_batch(image_paths, batch_size=batch_size)
+        except MemoryError:
+            if batch_size <= 1:
+                raise
+            reduced = max(1, batch_size // 2)
+            LOGGER.warning(
+                "OOM at detection batch_size=%s, retrying with batch_size=%s",
+                batch_size,
+                reduced,
+            )
+            return self.detect_faces_batch_with_retry(
+                image_paths,
+                batch_size=reduced,
+            )
+
+
 # ---------------------------------------------------------------------------
 # Component 2 — incremental clustering & progressive learning
 # ---------------------------------------------------------------------------
@@ -1498,6 +1559,7 @@ def ingest_image_to_database(
     file_path: str,
     mark_processed: bool = True,
     face_buffer: FaceInsertBuffer | None = None,
+    detections: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
     Detect faces in an image and persist them to SQLite.
@@ -1547,7 +1609,8 @@ def ingest_image_to_database(
     photo_id = database.insert_photo(path)
 
     try:
-        detections = ai_engine.process_image(path)
+        if detections is None:
+            detections = ai_engine.process_image(path)
         face_ids: list[int] = []
 
         if face_buffer is not None:

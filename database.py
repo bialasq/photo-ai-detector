@@ -2727,6 +2727,21 @@ class DatabaseManager:
             row = self._execute(connection, "PRAGMA integrity_check").fetchone()
         return str(row[0]) if row is not None else "unknown"
 
+    def require_database_integrity(self) -> None:
+        """
+        Abort startup when ``PRAGMA integrity_check`` reports corruption (task 1.3.4).
+        """
+        try:
+            result = self.integrity_check()
+        except sqlite3.DatabaseError as exc:
+            LOGGER.error("Database integrity check failed: %s", exc)
+            raise DatabaseError(f"Database integrity check failed: {exc}") from exc
+
+        if result == "ok":
+            return
+        LOGGER.error("Database integrity check failed: %s", result)
+        raise DatabaseError(f"Database integrity check failed: {result}")
+
     def get_schema_version_info(self) -> dict[str, int]:
         """
         Return row counts per table (quick health snapshot for logging / UI).

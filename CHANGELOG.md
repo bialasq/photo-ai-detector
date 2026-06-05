@@ -23,3 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Database (task 1.3.2):** Numbered SQL migrations in `migrations/` with `schema_migrations` tracking, pre-migrate backup (`organizer.db.bak.{version}`), rollback on failure, dry-run via `PHOTO_ORGANIZER_MIGRATE_DRY_RUN=1`.
 - **Performance (task 1.3.1):** Gallery/cluster indexes in `migrations/003_indexes.sql` (EXPLAIN-verified). Documented in `docs/DB_INDEXES.md`.
 - **Performance (task 1.3.3):** Batched face inserts (`insert_faces_batch`, `FaceInsertBuffer`) — 100 rows per SQLite transaction during folder scans; ≥5× faster than per-row inserts in benchmark.
+- **Database (task 1.3.4):** `require_database_integrity()` at sidecar startup; FK enforcement verified per connection.
+- **API (task 1.4.1):** `/api/v1/health` router, `src/api/client.ts`, `docs/API_VERSIONING.md` (legacy `/api/*` unchanged).
+- **API (task 1.4.2):** Strict POST request schemas in `schemas.py` with field constraints; 422 validation handler sanitizes error context.
+- **Performance (task 2.0.2):** `scripts/benchmark.py` + `docs/BENCHMARKS.md` for reproducible DB/gallery benchmarks.
+- **ML (task 2.1.1):** `detect_faces_batch` via ThreadPoolExecutor (32 images, OOM retry); scan loop processes detection batches before DB ingest.
