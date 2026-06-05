@@ -38,9 +38,9 @@ from pathlib import Path
 from typing import Any, Final, Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, Request, status
+from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -59,6 +59,13 @@ from database import (
     FaceRow,
     RecordNotFoundError,
     ValidationError,
+)
+from errors import (
+    ErrorCode,
+    ErrorResponse,
+    PathValidationError,
+    raise_api_error,
+    register_exception_handlers,
 )
 from logging_config import (
     DEV_MODE_ENV_VAR,
@@ -427,12 +434,6 @@ class PersonSummaryItem(BaseModel):
         None,
         description="Bounding box of the exemplar face in pixel coordinates.",
     )
-
-
-class ErrorResponse(BaseModel):
-    """Standard error payload (documented in OpenAPI responses)."""
-
-    detail: str
 
 
 # ---------------------------------------------------------------------------
@@ -881,7 +882,7 @@ def resolve_and_validate_folder(folder_path: str) -> Path:
         ValueError: Path is not a directory (generic fallback).
     """
     if "\0" in folder_path:
-        raise ValueError("folder_path contains null byte")
+        raise PathValidationError("folder_path contains null byte")
 
     resolved = Path(folder_path).expanduser().resolve()
 
@@ -895,8 +896,8 @@ def resolve_and_validate_folder(folder_path: str) -> Path:
     normalized = str(resolved).rstrip("\\/")
     drive, tail = os.path.splitdrive(normalized)
     if drive and not tail.lstrip("\\/"):
-        raise ValueError(
-            f"Refusing to scan drive root {resolved}. Select a photo folder, not an entire disk."
+        raise PathValidationError(
+            f"Refusing to scan drive root {resolved}. Select a photo folder, not an entire disk.",
         )
 
     return resolved
@@ -1167,71 +1168,93 @@ def face_preview_item_from_row(face_row: FaceRow, *, width: int) -> FacePreviewI
 
 def raise_http_exception_from_error(exc: Exception) -> None:
     """
-    Map domain / IO exceptions to FastAPI HTTPException with helpful details.
+    Map domain / IO exceptions to ``HTTPException`` with ``ErrorResponse`` detail.
 
     Always raises — never returns.
     """
     if isinstance(exc, HTTPException):
         raise exc
 
-    if isinstance(exc, ValidationError):
-        raise HTTPException(
+    if isinstance(exc, PathValidationError):
+        raise_api_error(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Validation error: {exc}",
-        ) from exc
+            error=exc.message,
+            code=ErrorCode.PATH_INVALID,
+            details=exc.details or None,
+        )
+
+    if isinstance(exc, ValidationError):
+        raise_api_error(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            error=str(exc),
+            code=ErrorCode.VALIDATION_ERROR,
+        )
 
     if isinstance(exc, (FileNotFoundError, RecordNotFoundError)):
-        raise HTTPException(
+        raise_api_error(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(exc),
-        ) from exc
+            error=str(exc),
+            code=ErrorCode.NOT_FOUND,
+        )
 
     if isinstance(exc, NotADirectoryError):
-        raise HTTPException(
+        raise_api_error(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(exc),
-        ) from exc
+            error=str(exc),
+            code=ErrorCode.PATH_INVALID,
+        )
 
     if isinstance(exc, (FaceDetectionError, AICoreError)):
-        raise HTTPException(
+        raise_api_error(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"AI processing error: {exc}",
-        ) from exc
+            error=str(exc),
+            code=ErrorCode.AI_CORE_FAILURE,
+            hint=getattr(exc, "hint", None),
+            details=getattr(exc, "context", None) or None,
+        )
 
     if isinstance(exc, ClusteringError):
-        raise HTTPException(
+        raise_api_error(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Clustering error: {exc}",
-        ) from exc
+            error=str(exc),
+            code=ErrorCode.AI_CORE_FAILURE,
+            hint=getattr(exc, "hint", None),
+            details=getattr(exc, "context", None) or None,
+        )
 
     if isinstance(exc, DatabaseError):
-        raise HTTPException(
+        raise_api_error(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database error: {exc}",
-        ) from exc
+            error=str(exc),
+            code=ErrorCode.INTERNAL_ERROR,
+        )
 
     if isinstance(exc, (ValueError, UnidentifiedImageError)):
-        raise HTTPException(
+        raise_api_error(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(exc),
-        ) from exc
+            error=str(exc),
+            code=ErrorCode.VALIDATION_ERROR,
+        )
 
     if isinstance(exc, PermissionError):
-        raise HTTPException(
+        raise_api_error(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Permission denied: {exc}",
-        ) from exc
+            error=f"Permission denied: {exc}",
+            code=ErrorCode.INTERNAL_ERROR,
+        )
 
     if isinstance(exc, OSError):
-        raise HTTPException(
+        raise_api_error(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Filesystem error: {exc}",
-        ) from exc
+            error=f"Filesystem error: {exc}",
+            code=ErrorCode.INTERNAL_ERROR,
+        )
 
-    raise HTTPException(
+    raise_api_error(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        detail=f"Unexpected server error: {type(exc).__name__}: {exc}",
-    ) from exc
+        error=f"Unexpected server error: {type(exc).__name__}: {exc}",
+        code=ErrorCode.INTERNAL_ERROR,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1429,25 +1452,28 @@ async def start_folder_scan(
 
     async with services.scan_task_lock:
         if services.scan_state.is_active:
-            raise HTTPException(
+            raise_api_error(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=(
+                error=(
                     "A folder scan is already in progress. "
                     "Poll GET /api/scan-status until is_active is false before starting another scan."
                 ),
+                code=ErrorCode.SCAN_IN_PROGRESS,
             )
 
         if services.scan_task is not None and not services.scan_task.done():
-            raise HTTPException(
+            raise_api_error(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="Previous scan task has not completed yet.",
+                error="Previous scan task has not completed yet.",
+                code=ErrorCode.SCAN_IN_PROGRESS,
             )
 
         acquired = services.scan_state.try_begin_scan(total_files=total_files)
         if not acquired:
-            raise HTTPException(
+            raise_api_error(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="Scanner is already active (could not acquire scan lock).",
+                error="Scanner is already active (could not acquire scan lock).",
+                code=ErrorCode.SCAN_IN_PROGRESS,
             )
 
         services.ai_engine.reset_runtime()
@@ -1556,25 +1582,6 @@ async def lifespan(application: FastAPI):
     _services = None
 
 
-async def aicore_exception_handler(request: Request, exc: AICoreError) -> JSONResponse:
-    """Return a stable 500 JSON payload for uncaught AI core domain errors."""
-    LOGGER.error(
-        "AICoreError in %s: %s",
-        request.url.path,
-        exc,
-        extra={"context": exc.context, "error_type": type(exc).__name__},
-        exc_info=True,
-    )
-    return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={
-            "error": str(exc),
-            "code": "ai_core_failure",
-            "hint": "Check backend logs. Restart the app if scan is stuck.",
-        },
-    )
-
-
 def create_application(*, dev_mode: bool | None = None) -> FastAPI:
     """Build and configure the FastAPI application instance."""
     application = FastAPI(
@@ -1599,7 +1606,7 @@ def create_application(*, dev_mode: bool | None = None) -> FastAPI:
         max_age=600,
     )
 
-    application.add_exception_handler(AICoreError, aicore_exception_handler)
+    register_exception_handlers(application)
 
     register_routes(application, dev_mode=dev_mode)
     return application

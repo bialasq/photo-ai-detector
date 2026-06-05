@@ -1,3 +1,9 @@
+import {
+  apiErrorMessage,
+  isApiError,
+  parseApiErrorBody,
+  type ApiErrorBody,
+} from "@/api/errors";
 import type {
   DevSimulateScanRequest,
   GalleryQueryParams,
@@ -64,6 +70,11 @@ function isFastApiValidationErrorItem(
 }
 
 function extractDetailMessage(body: unknown): string | null {
+  const apiError = parseApiErrorBody(body);
+  if (apiError !== null) {
+    return apiErrorMessage(apiError);
+  }
+
   if (!isRecord(body)) {
     return null;
   }
@@ -88,6 +99,9 @@ function extractDetailMessage(body: unknown): string | null {
 
   return null;
 }
+
+export type { ApiErrorBody };
+export { isApiError, parseApiErrorBody };
 
 async function parseErrorMessage(response: Response): Promise<string> {
   const fallback = `Request failed with status ${response.status} ${response.statusText}`;
