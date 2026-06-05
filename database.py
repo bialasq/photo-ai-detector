@@ -42,6 +42,8 @@ LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 DB_PATH_ENV_VAR: Final[str] = "PHOTO_ORGANIZER_DB_PATH"
 APP_DATA_ENV_VAR: Final[str] = "PHOTO_ORGANIZER_APP_DATA"
 DB_FILENAME: Final[str] = "organizer.db"
+MIGRATE_DRY_RUN_ENV_VAR: Final[str] = "PHOTO_ORGANIZER_MIGRATE_DRY_RUN"
+MIGRATIONS_DIR: Final[Path] = Path(__file__).resolve().parent / "migrations"
 
 # Deprecated: explicit paths in tests should use tmp_path or PHOTO_ORGANIZER_DB_PATH.
 DEFAULT_DB_PATH: Final[str] = DB_FILENAME
@@ -847,41 +849,140 @@ class DatabaseManager:
                     "ALTER TABLE faces ADD COLUMN cluster_id INTEGER",
                 )
 
-    def _ensure_schema_indexes(self, connection: sqlite3.Connection) -> None:
+    def _ensure_schema_migrations_table(self, connection: sqlite3.Connection) -> None:
+        self._execute(
+            connection,
+            """
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version     INTEGER PRIMARY KEY,
+                applied_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+        )
+
+    def _current_migration_version(self, connection: sqlite3.Connection) -> int:
+        if not self._table_exists(connection, "schema_migrations"):
+            return 0
+        row = self._execute(
+            connection,
+            "SELECT COALESCE(MAX(version), 0) AS current_version FROM schema_migrations",
+        ).fetchone()
+        return int(row["current_version"]) if row is not None else 0
+
+    def _stamp_migration_version(self, connection: sqlite3.Connection, version: int) -> None:
+        self._execute(
+            connection,
+            "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)",
+            (version,),
+        )
+
+    def _migration_files(self) -> list[tuple[int, Path]]:
+        if not MIGRATIONS_DIR.is_dir():
+            raise DatabaseError(f"Migrations directory not found: {MIGRATIONS_DIR}")
+
+        files: list[tuple[int, Path]] = []
+        for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+            prefix = path.name.split("_", 1)[0]
+            if not prefix.isdigit():
+                raise DatabaseError(f"Invalid migration filename (expected NNN_name.sql): {path.name}")
+            files.append((int(prefix), path))
+        return files
+
+    def _backup_database_before_migration(self, current_version: int) -> Path:
+        source = Path(self.db_path)
+        backup_path = source.with_name(f"{source.name}.bak.{current_version}")
+        shutil.copy2(source, backup_path)
+        LOGGER.info(
+            "Database backup created before migration: %s",
+            backup_path,
+        )
+        return backup_path
+
+    def _restore_database_backup(self, current_version: int) -> None:
+        source = Path(self.db_path)
+        backup_path = source.with_name(f"{source.name}.bak.{current_version}")
+        if not backup_path.is_file():
+            LOGGER.error("Migration rollback backup missing: %s", backup_path)
+            return
+        shutil.copy2(backup_path, source)
+        LOGGER.warning("Restored database from backup: %s", backup_path)
+
+    def apply_pending_migrations(self, connection: sqlite3.Connection | None = None) -> int:
         """
-        Create performance indexes after tables and migrations are complete.
+        Apply numbered SQL migrations from ``migrations/``.
 
-        Must run only when referenced columns exist (legacy DB files upgraded via ALTER).
+        Returns the highest applied migration version.
         """
-        index_statements: list[str] = [
-            "CREATE INDEX IF NOT EXISTS idx_photos_file_path ON photos(file_path)",
-            "CREATE INDEX IF NOT EXISTS idx_photos_processed ON photos(processed)",
-            "CREATE INDEX IF NOT EXISTS idx_photos_faceless ON photos(has_faces) WHERE processed = 1 AND has_faces = 0",
-            "CREATE INDEX IF NOT EXISTS idx_people_name ON people(name COLLATE NOCASE)",
-            "CREATE INDEX IF NOT EXISTS idx_faces_photo_id ON faces(photo_id)",
-            "CREATE INDEX IF NOT EXISTS idx_faces_unassigned ON faces(photo_id) WHERE person_id IS NULL",
-        ]
+        if connection is not None:
+            return self._apply_pending_migrations_on_connection(connection)
 
-        if self._table_exists(connection, "faces"):
-            face_columns = self._table_columns(connection, "faces")
-            if "person_id" in face_columns:
-                index_statements.append(
-                    "CREATE INDEX IF NOT EXISTS idx_faces_person_id ON faces(person_id)"
-                )
-            if "cluster_id" in face_columns:
-                index_statements.extend(
-                    [
-                        "CREATE INDEX IF NOT EXISTS idx_faces_cluster_id ON faces(cluster_id)",
-                        (
-                            "CREATE INDEX IF NOT EXISTS idx_faces_unclustered_unassigned "
-                            "ON faces(cluster_id) "
-                            "WHERE person_id IS NULL AND cluster_id IS NOT NULL"
-                        ),
-                    ]
-                )
+        managed = self._get_connection()
+        try:
+            return self._apply_pending_migrations_on_connection(managed)
+        finally:
+            managed.close()
 
-        for statement in index_statements:
-            self._execute(connection, statement)
+    def _apply_pending_migrations_on_connection(
+        self,
+        connection: sqlite3.Connection,
+    ) -> int:
+        dry_run = os.environ.get(MIGRATE_DRY_RUN_ENV_VAR, "0").strip() == "1"
+
+        self._ensure_schema_migrations_table(connection)
+        current = self._current_migration_version(connection)
+        latest = current
+
+        for version, path in self._migration_files():
+            if version <= current:
+                continue
+            if dry_run:
+                LOGGER.info(
+                    "Migration dry-run: would apply %s (version %s)",
+                    path.name,
+                    version,
+                )
+                latest = version
+                continue
+
+            sql = path.read_text(encoding="utf-8")
+            connection.commit()
+            connection.execute("PRAGMA wal_checkpoint(FULL)")
+            backup_path = self._backup_database_before_migration(current)
+            try:
+                self._executescript(connection, sql)
+                self._execute(
+                    connection,
+                    "INSERT INTO schema_migrations (version) VALUES (?)",
+                    (version,),
+                )
+                connection.commit()
+            except Exception as exc:
+                connection.rollback()
+                connection.close()
+                self._restore_database_backup(current)
+                raise DatabaseError(
+                    f"Migration {path.name} failed; database restored from {backup_path.name}"
+                ) from exc
+
+            current = version
+            latest = version
+            LOGGER.info("Applied migration %s (version %s)", path.name, version)
+
+        return latest
+
+    @staticmethod
+    def explain_query_plan(
+        connection: sqlite3.Connection,
+        sql: str,
+        parameters: Sequence[Any] = (),
+    ) -> str:
+        """Return EXPLAIN QUERY PLAN output for diagnostics and perf tests."""
+        rows = DatabaseManager._execute(
+            connection,
+            f"EXPLAIN QUERY PLAN {sql}",
+            parameters,
+        ).fetchall()
+        return "\n".join(str(dict(row)) for row in rows)
 
     # ------------------------------------------------------------------
     # Schema
@@ -889,49 +990,30 @@ class DatabaseManager:
 
     def create_tables(self) -> None:
         """
-        Create all tables and performance indexes if they do not already exist.
+        Create all tables and apply pending numbered migrations.
 
-        Execution order (critical for legacy organizer.db files):
-          1. CREATE TABLE IF NOT EXISTS — never fails on old files missing new columns
-          2. _apply_migrations — ALTER TABLE adds cluster_id / created_at / person_id
-          3. _ensure_schema_indexes — indexes only after columns exist
+        Execution order:
+          1. ``schema_migrations`` table
+          2. Legacy bootstrap (pre-versioned DB files upgraded in-process)
+          3. ``apply_pending_migrations`` — ``001`` … ``003`` SQL files
         """
         db_file = Path(self.db_path)
         parent = db_file.parent
         if parent != Path(".") and str(parent) not in ("", "."):
             parent.mkdir(parents=True, exist_ok=True)
 
-        tables_script = """
-        CREATE TABLE IF NOT EXISTS photos (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_path   TEXT UNIQUE NOT NULL,
-            date_added  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            processed   INTEGER NOT NULL DEFAULT 0 CHECK (processed IN (0, 1)),
-            has_faces   INTEGER NOT NULL DEFAULT 1 CHECK (has_faces IN (0, 1))
-        );
-
-        CREATE TABLE IF NOT EXISTS people (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            name        TEXT,
-            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS faces (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            photo_id      INTEGER NOT NULL,
-            embedding     BLOB NOT NULL,
-            bounding_box  TEXT NOT NULL,
-            cluster_id    INTEGER,
-            person_id     INTEGER,
-            FOREIGN KEY (photo_id) REFERENCES photos(id) ON DELETE CASCADE,
-            FOREIGN KEY (person_id) REFERENCES people(id) ON DELETE SET NULL
-        );
-        """
-
         with self._managed_connection() as connection:
-            self._executescript(connection, tables_script)
-            self._apply_migrations(connection)
-            self._ensure_schema_indexes(connection)
+            self._ensure_schema_migrations_table(connection)
+            current = self._current_migration_version(connection)
+            if current == 0 and self._table_exists(connection, "photos"):
+                LOGGER.info(
+                    "Legacy database detected (no schema_migrations); upgrading in place"
+                )
+                self._apply_migrations(connection)
+                self._stamp_migration_version(connection, 1)
+                self._stamp_migration_version(connection, 2)
+
+        self.apply_pending_migrations()
 
         LOGGER.info("Database schema initialized at %s", self.db_path)
 

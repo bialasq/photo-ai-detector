@@ -11,6 +11,10 @@ from ai_core import l2_normalize
 from database import DatabaseManager, EXPECTED_EMBEDDING_DIMENSION
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line("markers", "slow: long-running performance benchmarks")
+
+
 @pytest.fixture
 def temp_db(tmp_path: Path) -> DatabaseManager:
     """Empty SQLite database with schema applied."""
