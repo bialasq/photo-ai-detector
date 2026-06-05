@@ -1193,15 +1193,27 @@ class ClusteringEngine:
         embedding_matrix = np.asarray(valid_embeddings, dtype=np.float64)
 
         try:
-            dbscan = DBSCAN(
+            labels = DBSCAN(
                 eps=eps,
                 min_samples=min_samples,
                 metric="cosine",
                 n_jobs=-1,
+            ).fit_predict(embedding_matrix)
+        except (ValueError, MemoryError, np.linalg.LinAlgError) as exc:
+            LOGGER.error(
+                "DBSCAN failed: %s",
+                exc,
+                exc_info=True,
+                extra={"n_embeddings": len(valid_faces)},
             )
-            labels = dbscan.fit_predict(embedding_matrix)
-        except Exception as exc:  # noqa: BLE001 — sklearn boundary
-            raise ClusteringError(f"DBSCAN failed: {exc}") from exc
+            raise ClusteringError(
+                "clustering failed",
+                context={
+                    "n_embeddings": len(valid_faces),
+                    "eps": eps,
+                    "min_samples": min_samples,
+                },
+            ) from exc
 
         LOGGER.info(
             "DBSCAN finished: %s face(s), unique labels=%s",
