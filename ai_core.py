@@ -759,13 +759,25 @@ class AICoreEngine:
         for backend in SUPPORTED_DETECTOR_BACKENDS:
             try:
                 LOGGER.info("Probing DeepFace detector backend '%s'...", backend)
-                DeepFace.represent(
-                    img_path=image,
-                    model_name=self.model_name,
-                    detector_backend=backend,
-                    enforce_detection=False,
-                    align=self.align,
-                )
+                try:
+                    DeepFace.represent(
+                        img_path=image,
+                        model_name=self.model_name,
+                        detector_backend=backend,
+                        enforce_detection=False,
+                        align=self.align,
+                    )
+                except (ValueError, MemoryError) as exc:
+                    LOGGER.error(
+                        "DeepFace.represent failed during detector probe for backend %s: %s",
+                        backend,
+                        exc,
+                        exc_info=True,
+                    )
+                    raise EmbeddingError(
+                        f"embedding failed during detector probe for backend {backend}",
+                        context={"path": "<in-memory-probe>"},
+                    ) from exc
                 self._active_detector_backend = backend
                 LOGGER.info("Selected detector backend '%s'", backend)
                 return backend
@@ -811,13 +823,25 @@ class AICoreEngine:
             detector_backend = self._probe_detector_backend(img)
 
             DeepFace = self._get_deepface()
-            raw_result = DeepFace.represent(
-                img_path=img,
-                model_name=self.model_name,
-                detector_backend=detector_backend,
-                enforce_detection=self.enforce_detection,
-                align=self.align,
-            )
+            try:
+                raw_result = DeepFace.represent(
+                    img_path=img,
+                    model_name=self.model_name,
+                    detector_backend=detector_backend,
+                    enforce_detection=self.enforce_detection,
+                    align=self.align,
+                )
+            except (ValueError, MemoryError) as exc:
+                LOGGER.error(
+                    "DeepFace.represent failed for %s: %s",
+                    image_path,
+                    exc,
+                    exc_info=True,
+                )
+                raise EmbeddingError(
+                    f"embedding failed for {image_path}",
+                    context={"path": str(image_path)},
+                ) from exc
 
             detected_faces = _parse_deepface_represent_result(
                 raw_result,
