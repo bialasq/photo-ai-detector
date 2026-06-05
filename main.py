@@ -38,9 +38,9 @@ from pathlib import Path
 from typing import Any, Final, Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -1504,6 +1504,25 @@ async def lifespan(application: FastAPI):
     _services = None
 
 
+async def aicore_exception_handler(request: Request, exc: AICoreError) -> JSONResponse:
+    """Return a stable 500 JSON payload for uncaught AI core domain errors."""
+    LOGGER.error(
+        "AICoreError in %s: %s",
+        request.url.path,
+        exc,
+        extra={"context": exc.context, "error_type": type(exc).__name__},
+        exc_info=True,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "error": str(exc),
+            "code": "ai_core_failure",
+            "hint": "Check backend logs. Restart the app if scan is stuck.",
+        },
+    )
+
+
 def create_application() -> FastAPI:
     """Build and configure the FastAPI application instance."""
     application = FastAPI(
@@ -1527,6 +1546,8 @@ def create_application() -> FastAPI:
         allow_headers=["*"],
         max_age=600,
     )
+
+    application.add_exception_handler(AICoreError, aicore_exception_handler)
 
     register_routes(application)
     return application
