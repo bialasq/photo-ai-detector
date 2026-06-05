@@ -161,17 +161,38 @@ SUPPORTED_IMAGE_SUFFIXES: Final[frozenset[str]] = frozenset(
 class AICoreError(Exception):
     """Base exception for AI core failures."""
 
+    default_code = "AI_CORE_FAILURE"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        context: dict[str, Any] | None = None,
+        hint: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code or self.default_code
+        self.context = context or {}
+        self.hint = hint
+
 
 class FaceDetectionError(AICoreError):
     """Raised when DeepFace detection/representation fails irrecoverably."""
+
+    default_code = "FACE_DETECTION_FAILED"
 
 
 class EmbeddingError(AICoreError):
     """Raised when an embedding has invalid shape or non-finite values."""
 
+    default_code = "EMBEDDING_INVALID"
+
 
 class ClusteringError(AICoreError):
     """Raised when DBSCAN or cluster bookkeeping fails."""
+
+    default_code = "CLUSTERING_FAILED"
 
 
 class ClusterNotFoundError(ClusteringError, LookupError):
