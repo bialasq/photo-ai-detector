@@ -15,7 +15,7 @@ import main
 def isolated_db_path(tmp_path, monkeypatch: pytest.MonkeyPatch) -> str:
     """Point lifespan startup at a throwaway SQLite file."""
     db_path = str(tmp_path / "test_organizer.db")
-    monkeypatch.setattr(main, "DEFAULT_DATABASE_PATH", db_path)
+    monkeypatch.setenv("PHOTO_ORGANIZER_DB_PATH", db_path)
     return db_path
 
 

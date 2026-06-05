@@ -15,7 +15,7 @@ from errors import ErrorCode
 @pytest.fixture
 def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """TestClient with isolated DB and without TensorFlow startup."""
-    monkeypatch.setattr(main, "DEFAULT_DATABASE_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setenv("PHOTO_ORGANIZER_DB_PATH", str(tmp_path / "test.db"))
     monkeypatch.setattr(main, "verify_ai_runtime_dependencies", lambda: None)
     application = main.create_application(dev_mode=False)
     with TestClient(application) as client:

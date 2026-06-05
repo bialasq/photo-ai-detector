@@ -100,7 +100,6 @@ def _resolve_project_root() -> Path:
 PROJECT_ROOT: Final[Path] = _resolve_project_root()
 DEFAULT_HOST: Final[str] = "127.0.0.1"
 DEFAULT_PORT: Final[int] = 8000
-DEFAULT_DATABASE_PATH: Final[str] = "organizer.db"
 
 API_PREFIX: Final[str] = "/api"
 
@@ -1541,7 +1540,7 @@ async def lifespan(application: FastAPI):
 
     verify_ai_runtime_dependencies()
 
-    database = DatabaseManager(db_path=DEFAULT_DATABASE_PATH)
+    database = DatabaseManager()
     database.create_tables()
 
     ai_engine = AICoreEngine()

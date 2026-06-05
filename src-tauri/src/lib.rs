@@ -35,6 +35,8 @@ const MIN_PYINSTALLER_SIDECAR_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Environment variable that enables `/api/dev/*` on the Python sidecar (must be `"1"`).
 const DEV_MODE_ENV: &str = "PHOTO_ORGANIZER_DEV";
+/// Explicit SQLite path injected into the sidecar (see `database.get_db_path()`).
+const DB_PATH_ENV: &str = "PHOTO_ORGANIZER_DB_PATH";
 
 /// Child process spawned by this app (sidecar or dev python). `None` when using an external server.
 struct BackendProcessState(Mutex<Option<CommandChild>>);
@@ -273,14 +275,20 @@ fn sidecar_working_directory(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+fn sidecar_database_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(sidecar_working_directory(app)?.join("organizer.db"))
+}
+
 /// Apply shared sidecar environment. ``PHOTO_ORGANIZER_DEV=1`` is injected only in debug builds
 /// so release MSI installs never expose developer HTTP routes.
 fn apply_sidecar_env(
     command: tauri_plugin_shell::process::Command,
+    db_path: &Path,
 ) -> tauri_plugin_shell::process::Command {
     let command = command
         .env("PHOTO_ORGANIZER_HOST", BACKEND_HOST)
         .env("PHOTO_ORGANIZER_PORT", BACKEND_PORT)
+        .env(DB_PATH_ENV, db_path.display().to_string())
         .env("PYTHONNOUSERSITE", "1");
 
     #[cfg(debug_assertions)]
@@ -300,11 +308,13 @@ fn spawn_packaged_sidecar(
 ) -> Result<(Receiver<CommandEvent>, CommandChild), String> {
     let work_dir = sidecar_working_directory(app)?;
     let project_root = sidecar_project_root(app, &work_dir)?;
+    let db_path = sidecar_database_path(app)?;
 
     log::info!(
-        "Spawning packaged sidecar '{SIDECAR_NAME}' (cwd: {}, PHOTO_AI_PROJECT_ROOT: {}, http://{BACKEND_HOST}:{BACKEND_PORT})",
+        "Spawning packaged sidecar '{SIDECAR_NAME}' (cwd: {}, PHOTO_AI_PROJECT_ROOT: {}, PHOTO_ORGANIZER_DB_PATH: {}, http://{BACKEND_HOST}:{BACKEND_PORT})",
         work_dir.display(),
-        project_root.display()
+        project_root.display(),
+        db_path.display()
     );
 
     let command = app
@@ -317,7 +327,7 @@ fn spawn_packaged_sidecar(
             )
         })?;
 
-    apply_sidecar_env(command)
+    apply_sidecar_env(command, &db_path)
         .env("PHOTO_AI_PROJECT_ROOT", project_root.display().to_string())
         .current_dir(&work_dir)
         .spawn()
@@ -365,11 +375,13 @@ fn spawn_dev_python_backend(
     }
 
     let python = resolve_dev_python(&project_root)?;
+    let db_path = sidecar_database_path(app)?;
 
     log::info!(
-        "Dev backend: {python} {} (cwd: {}, http://{BACKEND_HOST}:{BACKEND_PORT})",
+        "Dev backend: {python} {} (cwd: {}, PHOTO_ORGANIZER_DB_PATH: {}, http://{BACKEND_HOST}:{BACKEND_PORT})",
         main_py.display(),
-        project_root.display()
+        project_root.display(),
+        db_path.display()
     );
 
     apply_sidecar_env(
@@ -378,6 +390,7 @@ fn spawn_dev_python_backend(
             .args(["main.py"])
             .current_dir(&project_root)
             .env("PHOTO_AI_PROJECT_ROOT", project_root.display().to_string()),
+        &db_path,
     )
     .spawn()
     .map_err(|err| format!("dev python spawn failed: {err}"))

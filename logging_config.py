@@ -21,6 +21,8 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Final
 
+from database import get_app_data_dir
+
 DEV_MODE_ENV_VAR: Final[str] = "PHOTO_ORGANIZER_DEV"
 APP_DATA_ENV_VAR: Final[str] = "PHOTO_ORGANIZER_APP_DATA"
 LOG_DIR_ENV_VAR: Final[str] = "PHOTO_ORGANIZER_LOG_DIR"
@@ -42,38 +44,6 @@ def is_dev_mode(*, override: bool | None = None) -> bool:
     if override is not None:
         return override
     return os.environ.get(DEV_MODE_ENV_VAR, "0").strip() == "1"
-
-
-def get_app_data_dir() -> Path:
-    """
-    Return the writable application data root.
-
-    Windows: ``%AppData%\\com.photo.organizer``
-    macOS: ``~/Library/Application Support/com.photo.organizer``
-    Linux: ``~/.local/share/com.photo.organizer``
-    """
-    override = os.environ.get(APP_DATA_ENV_VAR, "").strip()
-    if override:
-        base = Path(override).expanduser()
-        if not base.is_absolute():
-            base = (Path.cwd() / base).resolve()
-        else:
-            base = base.resolve()
-    elif sys.platform == "win32":
-        appdata = os.environ.get("APPDATA", "").strip()
-        if not appdata:
-            raise RuntimeError(
-                "APPDATA environment variable is not set; "
-                f"set {APP_DATA_ENV_VAR} to override the data directory."
-            )
-        base = Path(appdata) / "com.photo.organizer"
-    elif sys.platform == "darwin":
-        base = Path.home() / "Library" / "Application Support" / "com.photo.organizer"
-    else:
-        base = Path.home() / ".local" / "share" / "com.photo.organizer"
-
-    base.mkdir(parents=True, exist_ok=True)
-    return base
 
 
 def get_log_dir() -> Path:

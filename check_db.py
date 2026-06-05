@@ -1,6 +1,8 @@
 import sqlite3
 
-conn = sqlite3.connect("organizer.db")
+from database import get_db_path
+
+conn = sqlite3.connect(get_db_path())
 cursor = conn.cursor()
 
 print("--- ZDJĘCIA W BAZIE ---")

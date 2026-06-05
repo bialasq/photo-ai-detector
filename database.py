@@ -23,8 +23,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
 import sqlite3
 import struct
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,7 +39,12 @@ from typing import Any, Final, Generator, Iterable, Optional, Sequence
 
 LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
-DEFAULT_DB_PATH: Final[str] = "organizer.db"
+DB_PATH_ENV_VAR: Final[str] = "PHOTO_ORGANIZER_DB_PATH"
+APP_DATA_ENV_VAR: Final[str] = "PHOTO_ORGANIZER_APP_DATA"
+DB_FILENAME: Final[str] = "organizer.db"
+
+# Deprecated: explicit paths in tests should use tmp_path or PHOTO_ORGANIZER_DB_PATH.
+DEFAULT_DB_PATH: Final[str] = DB_FILENAME
 
 # InsightFace / ArcFace standard output size for this project.
 EXPECTED_EMBEDDING_DIMENSION: Final[int] = 512
@@ -46,6 +54,114 @@ EMBEDDING_BLOB_FORMAT: Final[str] = f"{EXPECTED_EMBEDDING_DIMENSION}f"
 EMBEDDING_BLOB_BYTE_SIZE: Final[int] = EXPECTED_EMBEDDING_DIMENSION * 4
 
 BOUNDING_BOX_KEYS: Final[tuple[str, ...]] = ("x", "y", "w", "h")
+
+
+def get_app_data_dir() -> Path:
+    """
+    Return the writable application data root.
+
+    Windows: ``%AppData%\\com.photo.organizer``
+    macOS: ``~/Library/Application Support/com.photo.organizer``
+    Linux: ``~/.local/share/com.photo.organizer``
+    """
+    override = os.environ.get(APP_DATA_ENV_VAR, "").strip()
+    if override:
+        base = Path(override).expanduser()
+        if not base.is_absolute():
+            base = (Path.cwd() / base).resolve()
+        else:
+            base = base.resolve()
+    elif sys.platform == "win32":
+        appdata = os.environ.get("APPDATA", "").strip()
+        if not appdata:
+            raise RuntimeError(
+                "APPDATA environment variable is not set; "
+                f"set {APP_DATA_ENV_VAR} or {DB_PATH_ENV_VAR} to override."
+            )
+        base = Path(appdata) / "com.photo.organizer"
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support" / "com.photo.organizer"
+    else:
+        base = Path.home() / ".local" / "share" / "com.photo.organizer"
+
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _legacy_database_candidates() -> list[Path]:
+    """Locations checked for a pre-migration ``organizer.db`` (copy-only, never delete)."""
+    candidates: list[Path] = []
+    project_root = os.environ.get("PHOTO_AI_PROJECT_ROOT", "").strip()
+    if project_root:
+        root = Path(project_root).expanduser()
+        if not root.is_absolute():
+            root = (Path.cwd() / root).resolve()
+        else:
+            root = root.resolve()
+        candidates.append(root / DB_FILENAME)
+    candidates.append(Path.cwd() / DB_FILENAME)
+    return candidates
+
+
+def migrate_legacy_database_if_needed(target: Path) -> None:
+    """
+    One-time copy of ``organizer.db`` from repo/CWD into AppData when target is missing.
+
+    Aligns with PRODUCT_SCOPE v1.0: preserve user library data. Legacy files are left
+    in place; operators may delete them manually after verifying the migration.
+    """
+    if target.is_file():
+        return
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target_resolved = target.resolve()
+
+    for legacy in _legacy_database_candidates():
+        if not legacy.is_file():
+            continue
+        legacy_resolved = legacy.resolve()
+        if legacy_resolved == target_resolved:
+            return
+
+        LOGGER.warning(
+            "Migrating legacy database from %s to %s (original file preserved)",
+            legacy_resolved,
+            target_resolved,
+        )
+        shutil.copy2(legacy_resolved, target_resolved)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{legacy_resolved}{suffix}")
+            if sidecar.is_file():
+                shutil.copy2(sidecar, Path(f"{target_resolved}{suffix}"))
+        return
+
+
+def get_db_path(*, migrate_legacy: bool = True) -> Path:
+    """
+    Resolve the SQLite database file path for this installation.
+
+    Priority:
+      1. ``PHOTO_ORGANIZER_DB_PATH`` environment variable (absolute or CWD-relative)
+      2. Platform application data directory + ``organizer.db``
+
+    When ``migrate_legacy`` is True and the AppData file does not exist yet, a
+    copy is made from ``PHOTO_AI_PROJECT_ROOT/organizer.db`` or ``./organizer.db``.
+    """
+    override = os.environ.get(DB_PATH_ENV_VAR, "").strip()
+    if override:
+        path = Path(override).expanduser()
+        if not path.is_absolute():
+            path = (Path.cwd() / path).resolve()
+        else:
+            path = path.resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    target = get_app_data_dir() / DB_FILENAME
+    if migrate_legacy:
+        migrate_legacy_database_if_needed(target)
+    return target
+
 
 # DBSCAN noise is persisted as NULL in faces.cluster_id (never a named cluster id).
 # Legitimate multi-face groups use cluster_id >= 0.
@@ -457,14 +573,19 @@ class DatabaseManager:
       - Every SQL statement is logged at DEBUG via `_execute` / `_executemany` / `_executescript`.
     """
 
-    def __init__(self, db_path: str = DEFAULT_DB_PATH) -> None:
+    def __init__(self, db_path: str | None = None, *, migrate_legacy: bool = True) -> None:
         """
         Args:
-            db_path: Filesystem path to the SQLite database file.
+            db_path: SQLite file path. When omitted, uses ``get_db_path()``.
+            migrate_legacy: When resolving the default path, copy legacy CWD/repo DB once.
         """
+        if db_path is None:
+            self.db_path = str(get_db_path(migrate_legacy=migrate_legacy))
+            return
+
         if not isinstance(db_path, str) or not db_path.strip():
             raise ValidationError("db_path must be a non-empty string")
-        self.db_path: str = db_path.strip()
+        self.db_path = db_path.strip()
 
     # ------------------------------------------------------------------
     # Connection layer
