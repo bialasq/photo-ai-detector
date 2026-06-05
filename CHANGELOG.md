@@ -22,3 +22,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Security (task 1.2.5):** Sidecar refuses non-loopback bind hosts; startup logs `Listening on 127.0.0.1:<port> (loopback-only)`.
 - **Database (task 1.3.2):** Numbered SQL migrations in `migrations/` with `schema_migrations` tracking, pre-migrate backup (`organizer.db.bak.{version}`), rollback on failure, dry-run via `PHOTO_ORGANIZER_MIGRATE_DRY_RUN=1`.
 - **Performance (task 1.3.1):** Gallery/cluster indexes in `migrations/003_indexes.sql` (EXPLAIN-verified). Documented in `docs/DB_INDEXES.md`.
+- **Performance (task 1.3.3):** Batched face inserts (`insert_faces_batch`, `FaceInsertBuffer`) — 100 rows per SQLite transaction during folder scans; ≥5× faster than per-row inserts in benchmark.

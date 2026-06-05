@@ -32,9 +32,12 @@ import numpy as np
 from sklearn.cluster import DBSCAN
 
 from database import (
+    DEFAULT_FACE_INSERT_BATCH_SIZE,
     EXPECTED_EMBEDDING_DIMENSION,
+    MAX_FACE_INSERT_BATCH_SIZE,
     DatabaseManager,
     FaceRow,
+    PendingFaceInsert,
     PersonRow,
     ValidationError,
 )
@@ -1428,6 +1431,62 @@ class ClusteringEngine:
 
 
 # ---------------------------------------------------------------------------
+# Face insert batching (task 1.3.3)
+# ---------------------------------------------------------------------------
+
+
+class FaceInsertBuffer:
+    """
+    Accumulate ``PendingFaceInsert`` rows and flush via ``insert_faces_batch``.
+
+    Used during folder scans so SQLite commits happen every ``batch_size`` faces
+    instead of once per row.
+    """
+
+    def __init__(
+        self,
+        database: DatabaseManager,
+        *,
+        batch_size: int = DEFAULT_FACE_INSERT_BATCH_SIZE,
+    ) -> None:
+        if batch_size <= 0 or batch_size > MAX_FACE_INSERT_BATCH_SIZE:
+            raise ValidationError(
+                f"batch_size must be between 1 and {MAX_FACE_INSERT_BATCH_SIZE}, got {batch_size}"
+            )
+        self._database = database
+        self._batch_size = batch_size
+        self._pending: list[PendingFaceInsert] = []
+
+    def __len__(self) -> int:
+        return len(self._pending)
+
+    def add(self, face: PendingFaceInsert) -> list[int]:
+        """Queue one face; flush automatically when the buffer reaches ``batch_size``."""
+        self._pending.append(face)
+        if len(self._pending) >= self._batch_size:
+            return self.flush()
+        return []
+
+    def extend(self, faces: Sequence[PendingFaceInsert]) -> list[int]:
+        """Queue many faces, flushing whenever the buffer fills."""
+        inserted_ids: list[int] = []
+        for face in faces:
+            inserted_ids.extend(self.add(face))
+        return inserted_ids
+
+    def flush(self) -> list[int]:
+        """Persist all pending faces (no-op when empty)."""
+        if not self._pending:
+            return []
+        pending = list(self._pending)
+        self._pending.clear()
+        return self._database.insert_faces_batch(
+            pending,
+            batch_size=self._batch_size,
+        )
+
+
+# ---------------------------------------------------------------------------
 # High-level orchestration helper (ingest one image end-to-end)
 # ---------------------------------------------------------------------------
 
@@ -1438,6 +1497,7 @@ def ingest_image_to_database(
     database: DatabaseManager,
     file_path: str,
     mark_processed: bool = True,
+    face_buffer: FaceInsertBuffer | None = None,
 ) -> dict[str, Any]:
     """
     Detect faces in an image and persist them to SQLite.
@@ -1490,14 +1550,25 @@ def ingest_image_to_database(
         detections = ai_engine.process_image(path)
         face_ids: list[int] = []
 
-        for detection in detections:
-            face_id = database.insert_face(
-                photo_id=photo_id,
-                embedding=detection["embedding"],
-                bounding_box=detection["bounding_box"],
-                enforce_embedding_dimension=True,
-            )
-            face_ids.append(face_id)
+        if face_buffer is not None:
+            pending_faces = [
+                PendingFaceInsert(
+                    photo_id=photo_id,
+                    embedding=detection["embedding"],
+                    bounding_box=detection["bounding_box"],
+                )
+                for detection in detections
+            ]
+            face_ids.extend(face_buffer.extend(pending_faces))
+        else:
+            for detection in detections:
+                face_id = database.insert_face(
+                    photo_id=photo_id,
+                    embedding=detection["embedding"],
+                    bounding_box=detection["bounding_box"],
+                    enforce_embedding_dimension=True,
+                )
+                face_ids.append(face_id)
     except AICoreError as exc:
         LOGGER.warning(
             "skipping %s: %s: %s",
@@ -1524,10 +1595,38 @@ def ingest_image_to_database(
         "photo_id": photo_id,
         "file_path": path,
         "face_ids": face_ids,
-        "detection_count": len(face_ids),
+        "detection_count": len(detections),
         "skipped": False,
-        "faceless": len(face_ids) == 0,
+        "faceless": len(detections) == 0,
     }
+
+
+def scan_directory(
+    *,
+    ai_engine: AICoreEngine,
+    database: DatabaseManager,
+    image_paths: Sequence[str | Path],
+    face_batch_size: int = DEFAULT_FACE_INSERT_BATCH_SIZE,
+) -> list[dict[str, Any]]:
+    """
+    Ingest a folder's image paths with batched face inserts (task 1.3.3).
+
+    Faces accumulate in a buffer and flush every ``face_batch_size`` rows (and once
+    more at the end of the directory scan).
+    """
+    buffer = FaceInsertBuffer(database, batch_size=face_batch_size)
+    summaries: list[dict[str, Any]] = []
+    for raw_path in image_paths:
+        summary = ingest_image_to_database(
+            ai_engine=ai_engine,
+            database=database,
+            file_path=str(raw_path),
+            mark_processed=True,
+            face_buffer=buffer,
+        )
+        summaries.append(summary)
+    buffer.flush()
+    return summaries
 
 
 # ---------------------------------------------------------------------------

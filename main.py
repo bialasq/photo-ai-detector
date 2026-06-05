@@ -50,6 +50,7 @@ from ai_core import (
     ClusteringEngine,
     ClusteringError,
     FaceDetectionError,
+    FaceInsertBuffer,
     ingest_image_to_database,
     verify_ai_runtime_dependencies,
 )
@@ -1289,6 +1290,7 @@ def _photo_already_ingested(
 def _ingest_single_image_sync(
     services: AppServices,
     image_path: Path,
+    face_buffer: FaceInsertBuffer | None = None,
 ) -> dict[str, Any]:
     """
     Synchronous wrapper executed inside `asyncio.to_thread`.
@@ -1300,6 +1302,7 @@ def _ingest_single_image_sync(
         database=services.database,
         file_path=str(image_path),
         mark_processed=True,
+        face_buffer=face_buffer,
     )
 
 
@@ -1332,6 +1335,7 @@ async def _execute_folder_scan_async(
       4. Always clear `is_active` in `finally`.
     """
     scan_state = services.scan_state
+    face_buffer = FaceInsertBuffer(services.database)
     LOGGER.info(
         "Background scan started",
         extra={
@@ -1368,6 +1372,7 @@ async def _execute_folder_scan_async(
                     _ingest_single_image_sync,
                     services,
                     image_path,
+                    face_buffer,
                 )
                 LOGGER.info(
                     "Scan file processed",
@@ -1400,6 +1405,8 @@ async def _execute_folder_scan_async(
                 scan_state.last_error = f"{image_path.name}: {exc}"
             finally:
                 scan_state.increment_processed()
+
+        await asyncio.to_thread(face_buffer.flush)
 
         LOGGER.info(
             "Folder ingestion complete — starting incremental clustering",

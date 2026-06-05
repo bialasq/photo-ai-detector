@@ -473,6 +473,50 @@ class FaceRow:
 
 
 @dataclass(frozen=True, slots=True)
+class PendingFaceInsert:
+    """
+    Face detection payload before persistence (no ``faces.id`` yet).
+
+    Used by ``insert_faces_batch`` and ``FaceInsertBuffer`` during folder scans.
+    """
+
+    photo_id: int
+    embedding: list[float]
+    bounding_box: dict[str, int]
+    cluster_id: Optional[int] = None
+
+
+DEFAULT_FACE_INSERT_BATCH_SIZE: Final[int] = 100
+MAX_FACE_INSERT_BATCH_SIZE: Final[int] = 500
+
+_FACE_INSERT_SQL: Final[str] = """
+    INSERT INTO faces (photo_id, embedding, bounding_box, cluster_id, person_id)
+    VALUES (?, ?, ?, ?, NULL)
+"""
+
+
+def insert_faces_batch(
+    connection: sqlite3.Connection,
+    manager: "DatabaseManager",
+    faces: Sequence[PendingFaceInsert],
+    batch_size: int = DEFAULT_FACE_INSERT_BATCH_SIZE,
+    *,
+    enforce_embedding_dimension: bool = True,
+) -> list[int]:
+    """
+    Insert face rows in transactional chunks via ``executemany`` (task 1.3.3).
+
+    Delegates to ``DatabaseManager.insert_faces_batch`` on the supplied connection.
+    """
+    return manager.insert_faces_batch(
+        faces,
+        connection=connection,
+        batch_size=batch_size,
+        enforce_embedding_dimension=enforce_embedding_dimension,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class PersonRow:
     """
     One row from the `people` table.
@@ -2000,6 +2044,127 @@ class DatabaseManager:
             valid_cluster_id,
         )
         return face_id
+
+    def insert_faces_batch(
+        self,
+        faces: Sequence[PendingFaceInsert],
+        *,
+        connection: sqlite3.Connection | None = None,
+        batch_size: int = DEFAULT_FACE_INSERT_BATCH_SIZE,
+        enforce_embedding_dimension: bool = True,
+    ) -> list[int]:
+        """
+        Insert many face rows using ``executemany`` inside per-chunk transactions.
+
+        Each chunk (default 100 rows) commits atomically; a failure rolls back only
+        the failing chunk.
+        """
+        if connection is not None:
+            return self._insert_faces_batch_on_connection(
+                connection,
+                faces,
+                batch_size=batch_size,
+                enforce_embedding_dimension=enforce_embedding_dimension,
+            )
+
+        with self._managed_connection() as managed:
+            return self._insert_faces_batch_on_connection(
+                managed,
+                faces,
+                batch_size=batch_size,
+                enforce_embedding_dimension=enforce_embedding_dimension,
+            )
+
+    def _insert_faces_batch_on_connection(
+        self,
+        connection: sqlite3.Connection,
+        faces: Sequence[PendingFaceInsert],
+        *,
+        batch_size: int,
+        enforce_embedding_dimension: bool,
+    ) -> list[int]:
+        if not isinstance(faces, Sequence) or isinstance(faces, (str, bytes)):
+            raise ValidationError("faces must be a sequence of PendingFaceInsert")
+        if batch_size <= 0 or batch_size > MAX_FACE_INSERT_BATCH_SIZE:
+            raise ValidationError(
+                f"batch_size must be between 1 and {MAX_FACE_INSERT_BATCH_SIZE}, got {batch_size}"
+            )
+        if not faces:
+            return []
+
+        prepared = self._prepare_face_insert_parameters(
+            connection,
+            faces,
+            enforce_embedding_dimension=enforce_embedding_dimension,
+        )
+
+        inserted_ids: list[int] = []
+        for offset in range(0, len(prepared), batch_size):
+            chunk = prepared[offset : offset + batch_size]
+            connection.execute("BEGIN")
+            try:
+                self._executemany(connection, _FACE_INSERT_SQL, chunk)
+                last_id = int(
+                    self._execute(connection, "SELECT last_insert_rowid()").fetchone()[0]
+                )
+                chunk_len = len(chunk)
+                inserted_ids.extend(range(last_id - chunk_len + 1, last_id + 1))
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+
+        LOGGER.debug(
+            "Batch inserted %s face row(s) in %s chunk(s)",
+            len(inserted_ids),
+            (len(prepared) + batch_size - 1) // batch_size,
+        )
+        return inserted_ids
+
+    def _prepare_face_insert_parameters(
+        self,
+        connection: sqlite3.Connection,
+        faces: Sequence[PendingFaceInsert],
+        *,
+        enforce_embedding_dimension: bool,
+    ) -> list[tuple[Any, ...]]:
+        photo_ids = {
+            self._validate_positive_int(face.photo_id, "photo_id") for face in faces
+        }
+        if photo_ids:
+            placeholders = ", ".join("?" for _ in photo_ids)
+            rows = self._execute(
+                connection,
+                f"SELECT id FROM photos WHERE id IN ({placeholders})",
+                tuple(sorted(photo_ids)),
+            ).fetchall()
+            existing_ids = {int(row["id"]) for row in rows}
+            missing = photo_ids - existing_ids
+            if missing:
+                raise RecordNotFoundError(
+                    f"No photo found for id(s)={sorted(missing)}"
+                )
+
+        prepared: list[tuple[Any, ...]] = []
+        for face in faces:
+            valid_photo_id = self._validate_positive_int(face.photo_id, "photo_id")
+            vector = self._validate_embedding(
+                face.embedding,
+                enforce_dimension=enforce_embedding_dimension,
+            )
+            valid_box = self._validate_bounding_box(face.bounding_box)
+            valid_cluster_id: Optional[int] = None
+            if face.cluster_id is not None:
+                valid_cluster_id = self._validate_cluster_id(face.cluster_id)
+            prepared.append(
+                (
+                    valid_photo_id,
+                    serialize_embedding_blob(vector),
+                    serialize_bounding_box(valid_box),
+                    valid_cluster_id,
+                )
+            )
+        return prepared
 
     def update_faces_cluster_id(
         self,
