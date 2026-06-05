@@ -1573,7 +1573,8 @@ def _run_smoke_test() -> None:
 
     Uses a temporary SQLite database; does not require OpenCV for the DBSCAN section.
     """
-    print("=== ai_core.py smoke test ===")
+    log = logging.getLogger(__name__)
+    log.info("=== ai_core.py smoke test ===")
 
     vector_a = l2_normalize([1.0] + [0.0] * (EXPECTED_EMBEDDING_DIMENSION - 1))
     vector_b = l2_normalize([1.0] + [0.0] * (EXPECTED_EMBEDDING_DIMENSION - 1))
@@ -1590,7 +1591,7 @@ def _run_smoke_test() -> None:
     assert classify_similarity(0.42) == SimilarityClass.BOUNDARY
     assert classify_similarity(0.50) == SimilarityClass.DIFFERENT
 
-    print("[OK] cosine distance + threshold classification")
+    log.info("[OK] cosine distance + threshold classification")
 
     test_db_path = "_ai_core_smoke_test.db"
     database = DatabaseManager(db_path=test_db_path)
@@ -1660,11 +1661,13 @@ def _run_smoke_test() -> None:
             assigned = database.get_faces_for_person(person_id)
             assert len(assigned) >= 1
 
-        print(
+        log.info(
             "[OK] DBSCAN incremental clustering "
-            f"(pending={len(clustering.pending_clusters)} auto={run_result.auto_assigned_faces} "
-            f"named_faces={run_result.faces_cluster_ids_written} "
-            f"noise_discarded={run_result.noise_faces_discarded})"
+            "pending=%s auto=%s named_faces=%s noise_discarded=%s",
+            len(clustering.pending_clusters),
+            run_result.auto_assigned_faces,
+            run_result.faces_cluster_ids_written,
+            run_result.noise_faces_discarded,
         )
 
         database.insert_person("Anna", relationship="rodzina")
@@ -1681,7 +1684,7 @@ def _run_smoke_test() -> None:
             assert dist < COSINE_DISTANCE_AUTO_SAME_PERSON_MAX or is_boundary_face(dist)
 
         clustering.clear_session_state()
-        print("[OK] progressive learning hooks")
+        log.info("[OK] progressive learning hooks")
 
     finally:
         Path(test_db_path).unlink(missing_ok=True)
@@ -1689,9 +1692,9 @@ def _run_smoke_test() -> None:
             Path(f"{test_db_path}{suffix}").unlink(missing_ok=True)
 
     if cv2_available():
-        print("[OK] OpenCV (cv2) available in current interpreter")
+        log.info("[OK] OpenCV (cv2) available in current interpreter")
     else:
-        print(
+        log.info(
             "[SKIP] OpenCV (cv2) not installed — clustering tests passed; "
             "activate venv and pip install -r requirements.txt for face detection"
         )
@@ -1702,16 +1705,17 @@ def _run_smoke_test() -> None:
         engine = AICoreEngine(model_name=PRIMARY_EMBEDDING_MODEL, enforce_detection=False)
         detections = engine.process_image(str(image_path))
         image_path.unlink(missing_ok=True)
-        print(
-            f"[OK] DeepFace probe completed (detections={len(detections)}, "
-            f"backend={engine.active_detector_backend})"
+        log.info(
+            "[OK] DeepFace probe completed detections=%s backend=%s",
+            len(detections),
+            engine.active_detector_backend,
         )
     except FaceDetectionError as exc:
-        print(f"[SKIP] DeepFace / OpenCV probe unavailable: {exc}")
+        log.info("[SKIP] DeepFace / OpenCV probe unavailable: %s", exc)
     except Exception as exc:  # noqa: BLE001 — smoke test must not fail on missing TF weights
-        print(f"[SKIP] DeepFace probe failed: {type(exc).__name__}: {exc}")
+        log.info("[SKIP] DeepFace probe failed: %s: %s", type(exc).__name__, exc)
 
-    print("=== ai_core.py smoke test: ALL CHECKS PASSED ===")
+    log.info("=== ai_core.py smoke test: ALL CHECKS PASSED ===")
 
 
 if __name__ == "__main__":

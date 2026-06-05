@@ -2442,7 +2442,7 @@ def _run_legacy_schema_migration_test() -> None:
             assert "cluster_id" in face_columns
 
         legacy_manager.update_faces_cluster_id([1], 0)
-        print("legacy schema migration test: OK")
+        logging.getLogger(__name__).info("legacy schema migration test: OK")
     finally:
         legacy_path.unlink(missing_ok=True)
         for suffix in ("-wal", "-shm"):
@@ -2616,7 +2616,7 @@ def _run_smoke_test() -> None:
         except RecordNotFoundError:
             pass
 
-        print("database.py smoke test: OK")
+        logging.getLogger(__name__).info("database.py smoke test: OK")
     finally:
         Path(test_db_path).unlink(missing_ok=True)
         wal = Path(f"{test_db_path}-wal")

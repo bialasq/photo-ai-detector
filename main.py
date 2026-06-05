@@ -60,6 +60,12 @@ from database import (
     RecordNotFoundError,
     ValidationError,
 )
+from logging_config import (
+    DEV_MODE_ENV_VAR,
+    hash_path_for_log,
+    is_dev_mode,
+    setup_logging,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -88,21 +94,6 @@ PROJECT_ROOT: Final[Path] = _resolve_project_root()
 DEFAULT_HOST: Final[str] = "127.0.0.1"
 DEFAULT_PORT: Final[int] = 8000
 DEFAULT_DATABASE_PATH: Final[str] = "organizer.db"
-
-DEV_MODE_ENV_VAR: Final[str] = "PHOTO_ORGANIZER_DEV"
-
-
-def is_dev_mode(*, override: bool | None = None) -> bool:
-    """
-    Return True when developer-only HTTP routes may be registered.
-
-    Controlled exclusively by the ``PHOTO_ORGANIZER_DEV`` environment variable
-    (must be exactly ``1``). Defaults to False — release builds never enable
-    dev routes unless the operator explicitly sets the variable.
-    """
-    if override is not None:
-        return override
-    return os.environ.get(DEV_MODE_ENV_VAR, "0").strip() == "1"
 
 API_PREFIX: Final[str] = "/api"
 
@@ -1062,11 +1053,15 @@ def discover_image_files_recursively(folder: Path) -> list[Path]:
 
     discovered.sort(key=lambda path: str(path).lower())
     LOGGER.info(
-        "Discovered %s image file(s) under %s (suffixes=%s, max=%s)",
-        len(discovered),
-        folder,
-        sorted(SCAN_IMAGE_SUFFIXES),
-        max_files,
+        "Discovered image files for scan",
+        extra={
+            "ctx": {
+                "event": "scan.discover",
+                "count": len(discovered),
+                "folder_hash": hash_path_for_log(folder),
+                "max_files": max_files,
+            }
+        },
     )
     return discovered
 
@@ -1314,9 +1309,14 @@ async def _execute_folder_scan_async(
     """
     scan_state = services.scan_state
     LOGGER.info(
-        "Background scan started: folder=%s files=%s",
-        folder,
-        len(image_files),
+        "Background scan started",
+        extra={
+            "ctx": {
+                "event": "scan.start",
+                "file_count": len(image_files),
+                "folder_hash": hash_path_for_log(folder),
+            }
+        },
     )
 
     try:
@@ -1326,20 +1326,18 @@ async def _execute_folder_scan_async(
 
             if _photo_already_ingested(services.database, image_path):
                 LOGGER.info(
-                    "Skipping file %s/%s: %s (already ingested)",
-                    index,
-                    len(image_files),
-                    resolved_path,
+                    "Skipping already-ingested file",
+                    extra={
+                        "ctx": {
+                            "event": "scan.file.skip",
+                            "index": index,
+                            "total": len(image_files),
+                            "path_hash": hash_path_for_log(resolved_path),
+                        }
+                    },
                 )
                 scan_state.increment_processed()
                 continue
-
-            LOGGER.info(
-                "Ingesting file %s/%s: %s",
-                index,
-                len(image_files),
-                resolved_path,
-            )
 
             try:
                 summary = await asyncio.to_thread(
@@ -1347,24 +1345,42 @@ async def _execute_folder_scan_async(
                     services,
                     image_path,
                 )
-                LOGGER.debug(
-                    "Ingested photo_id=%s faces=%s path=%s",
-                    summary.get("photo_id"),
-                    summary.get("detection_count"),
-                    resolved_path,
+                LOGGER.info(
+                    "Scan file processed",
+                    extra={
+                        "ctx": {
+                            "event": "scan.file.done",
+                            "index": index,
+                            "total": len(image_files),
+                            "path_hash": hash_path_for_log(resolved_path),
+                            "photo_id": summary.get("photo_id"),
+                            "faces": summary.get("detection_count"),
+                        }
+                    },
                 )
             except Exception as exc:  # noqa: BLE001 — continue scan; record last error
                 LOGGER.exception(
-                    "Failed to ingest %s: %s: %s",
-                    image_path,
+                    "Failed to ingest file %s: %s: %s",
+                    hash_path_for_log(image_path),
                     type(exc).__name__,
                     exc,
+                    extra={
+                        "ctx": {
+                            "event": "scan.file.error",
+                            "index": index,
+                            "total": len(image_files),
+                            "path_hash": hash_path_for_log(resolved_path),
+                        }
+                    },
                 )
                 scan_state.last_error = f"{image_path.name}: {exc}"
             finally:
                 scan_state.increment_processed()
 
-        LOGGER.info("Folder ingestion complete — starting incremental clustering")
+        LOGGER.info(
+            "Folder ingestion complete — starting incremental clustering",
+            extra={"ctx": {"event": "scan.ingest.complete"}},
+        )
         scan_state.set_phase("clustering")
         scan_state.set_current_file(None)
         try:
@@ -1373,7 +1389,17 @@ async def _execute_folder_scan_async(
             LOGGER.exception("Incremental clustering failed: %s", exc)
             scan_state.last_error = f"Clustering failed: {exc}"
 
-        LOGGER.info("Background scan finished successfully")
+        snapshot = scan_state.snapshot()
+        LOGGER.info(
+            "Background scan finished successfully",
+            extra={
+                "ctx": {
+                    "event": "scan.complete",
+                    "processed": snapshot["processed"],
+                    "total": snapshot["total"],
+                }
+            },
+        )
 
     except Exception as exc:  # noqa: BLE001 — catastrophic scan failure
         LOGGER.exception("Background scan aborted: %s", exc)
@@ -1474,10 +1500,18 @@ async def lifespan(application: FastAPI):
     """
     global _services
 
-    LOGGER.info("Starting photo organizer sidecar (offline FastAPI)")
+    setup_logging(level=os.environ.get("PHOTO_ORGANIZER_LOG_LEVEL", "INFO"))
+
+    LOGGER.info(
+        "Starting photo organizer sidecar (offline FastAPI)",
+        extra={"ctx": {"event": "sidecar.start"}},
+    )
 
     if is_dev_mode():
-        LOGGER.warning("DEV endpoints ENABLED — do not use in production")
+        LOGGER.warning(
+            "DEV endpoints ENABLED — do not use in production",
+            extra={"ctx": {"event": "dev_mode.enabled"}},
+        )
 
     verify_ai_runtime_dependencies()
 
@@ -2424,6 +2458,7 @@ def run_server(
 
     Binds only to loopback interface — not exposed to the LAN.
     """
+    setup_logging(level=log_level.upper())
     LOGGER.info("Launching Uvicorn on http://%s:%s", host, port)
     uvicorn.run(
         app,
@@ -2437,10 +2472,7 @@ def run_server(
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    )
+    setup_logging(level=os.environ.get("PHOTO_ORGANIZER_LOG_LEVEL", "INFO"))
     bind_host = os.environ.get("PHOTO_ORGANIZER_HOST", DEFAULT_HOST).strip() or DEFAULT_HOST
     bind_port_raw = os.environ.get("PHOTO_ORGANIZER_PORT", str(DEFAULT_PORT)).strip()
     try:
