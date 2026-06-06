@@ -35,6 +35,7 @@ function normalizeScanStatus(raw: ScanStatusResponse): ScanStatusResponse {
     phase,
     current_file: raw.current_file ?? null,
     last_error: raw.last_error ?? null,
+    cancelled: raw.cancelled ?? false,
   };
 }
 

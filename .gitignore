@@ -51,3 +51,32 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Benchmark + runtime artifacts
+.coverage
+_benchmark_*.db
+_benchmark_*.db.bak.*
+results/
+tests/fixtures/benchmarks/
+roadmap-bundle/
+
+# Benchmark + runtime artifacts
+.coverage
+_benchmark_*.db
+_benchmark_*.db.bak.*
+results/
+tests/fixtures/benchmarks/
+roadmap-bundle/
+diff-stat.txt
+pytest-out.txt
+
+# Benchmark + runtime artifacts
+.coverage
+_benchmark_*.db
+_benchmark_*.db.bak.*
+results/
+tests/fixtures/benchmarks/
+roadmap-bundle/
+audit-*.txt
+pytest-out.txt
+diff-stat.txt

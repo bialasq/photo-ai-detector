@@ -554,6 +554,29 @@ class UnnamedClusterSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class ClusterHealthRow:
+    """Latest DBSCAN quality metrics persisted after clustering (task 2.2.3)."""
+
+    id: int
+    run_at: str
+    silhouette: Optional[float]
+    db_score: Optional[float]
+    n_clusters: int
+    eps: float
+
+    @classmethod
+    def from_sqlite_row(cls, row: sqlite3.Row) -> ClusterHealthRow:
+        return cls(
+            id=int(row["id"]),
+            run_at=str(row["run_at"]),
+            silhouette=float(row["silhouette"]) if row["silhouette"] is not None else None,
+            db_score=float(row["db_score"]) if row["db_score"] is not None else None,
+            n_clusters=int(row["n_clusters"]),
+            eps=float(row["eps"]),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class PersonWithFaceCount:
     """
     Aggregated person record for UI galleries.
@@ -2450,6 +2473,19 @@ class DatabaseManager:
             ).fetchone()
         return int(row["cnt"]) if row is not None else 0
 
+    def iter_all_faces_with_embeddings(self) -> list[FaceRow]:
+        """Return every face row (used to rebuild the FAISS index)."""
+        with self._managed_connection() as connection:
+            rows = self._execute(
+                connection,
+                f"""
+                SELECT {FACE_COLUMNS}
+                FROM faces
+                ORDER BY id ASC
+                """,
+            ).fetchall()
+        return [FaceRow.from_sqlite_row(row) for row in rows]
+
     def delete_face(self, face_id: int) -> None:
         """Delete a single face row."""
         valid_id = self._validate_positive_int(face_id, "face_id")
@@ -2667,6 +2703,46 @@ class DatabaseManager:
             "get_photos_by_person_ids(%r) → %s photo(s)", unique_ids, len(results)
         )
         return results
+
+    # ------------------------------------------------------------------
+    # Cluster health (task 2.2.3)
+    # ------------------------------------------------------------------
+
+    def insert_cluster_health(
+        self,
+        *,
+        silhouette: float | None,
+        db_score: float | None,
+        n_clusters: int,
+        eps: float,
+    ) -> int:
+        """Persist one clustering quality snapshot."""
+        with self._managed_connection() as connection:
+            cursor = self._execute(
+                connection,
+                """
+                INSERT INTO cluster_health (silhouette, db_score, n_clusters, eps)
+                VALUES (?, ?, ?, ?)
+                """,
+                (silhouette, db_score, n_clusters, eps),
+            )
+            return int(cursor.lastrowid)
+
+    def get_latest_cluster_health(self) -> ClusterHealthRow | None:
+        """Return the most recent clustering quality row, if any."""
+        with self._managed_connection() as connection:
+            row = self._execute(
+                connection,
+                """
+                SELECT id, run_at, silhouette, db_score, n_clusters, eps
+                FROM cluster_health
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+            ).fetchone()
+        if row is None:
+            return None
+        return ClusterHealthRow.from_sqlite_row(row)
 
     # ------------------------------------------------------------------
     # Maintenance / diagnostics

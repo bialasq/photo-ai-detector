@@ -1,9 +1,15 @@
-import { Loader2, ScanLine, X } from "lucide-react";
+import { Loader2, Octagon, ScanLine, X } from "lucide-react";
 import { useAppContext } from "@/context/AppContext";
 
 export function ScanProgressOverlay(): JSX.Element | null {
-  const { scanDisplay, scanStatus, scanActionError, clearScanActionError } =
-    useAppContext();
+  const {
+    scanDisplay,
+    scanStatus,
+    scanActionError,
+    isScanning,
+    cancelFolderScan,
+    clearScanActionError,
+  } = useAppContext();
 
   if (scanDisplay === null) {
     return null;
@@ -58,6 +64,21 @@ export function ScanProgressOverlay(): JSX.Element | null {
               <p className="text-xs text-amber-400/90">
                 Last issue: {scanStatus.last_error}
               </p>
+            )}
+
+            {isScanning && scanDisplay.phase !== "cancelled" && (
+              <div className="flex justify-end pt-1">
+                <button
+                  type="button"
+                  onClick={() => {
+                    void cancelFolderScan();
+                  }}
+                  className="inline-flex items-center gap-2 rounded-lg border border-red-500/40 bg-red-950/50 px-3 py-1.5 text-xs font-semibold text-red-200 transition-colors hover:bg-red-900/60 hover:text-white"
+                >
+                  <Octagon className="h-3.5 w-3.5" aria-hidden="true" />
+                  Stop scan
+                </button>
+              </div>
             )}
           </div>
         </div>

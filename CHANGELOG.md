@@ -28,3 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **API (task 1.4.2):** Strict POST request schemas in `schemas.py` with field constraints; 422 validation handler sanitizes error context.
 - **Performance (task 2.0.2):** `scripts/benchmark.py` + `docs/BENCHMARKS.md` for reproducible DB/gallery benchmarks.
 - **ML (task 2.1.1):** `detect_faces_batch` via ThreadPoolExecutor (32 images, OOM retry); scan loop processes detection batches before DB ingest.
+- **Security (task 1.2.3):** `path_validation.validate_scan_path` — rejects `..`, symlink escapes, missing paths, files, and whole-disk roots unless `X-Confirm-Whole-Disk: 1`. Errors expose `path_hash` only.
+- **Stability (task 1.1.4):** React `ErrorBoundary` (app / gallery / people scopes), `POST /api/v1/log-error`, Vitest coverage.
+- **UX (task 1.4.3):** `POST /api/v1/scan-cancel`, cooperative cancellation between detection batches, Stop button in scan overlay.
+- **Release (task 0.2):** `docs/RELEASE.md` — Authenticode procurement checklist and MSI signing steps.
+- **Performance (task 2.0.1):** Extended `scripts/benchmark.py` — 1k/5k/10k datasets, RAM peak, FAISS identify latency, silhouette; fixture generator under `tests/fixtures/benchmarks/`.
+- **ML (task 2.1.3):** Opt-in GPU via `PHOTO_ORGANIZER_GPU=1` (`gpu.py`, `docs/GPU_SETUP.md`).
+- **ML (task 2.2.2):** `incremental_assign()` + `vector_store.py` (FAISS IndexFlatIP, rebuild/save after scan).
+- **ML (task 2.2.3):** Cluster quality metrics (`cluster_health` table, `GET /api/v1/clusters/health`).
+- **Frontend (tasks 2.3.1 / 2.3.2):** `react-window` gallery virtualization (>200 photos), `LazyThumbnail` with IntersectionObserver.

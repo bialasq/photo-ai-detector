@@ -37,7 +37,8 @@ def test_migrations_create_schema(migrations_dir: Path, tmp_path: Path) -> None:
         ).fetchone()[0]
 
     assert {"photos", "people", "faces", "schema_migrations"}.issubset(tables)
-    assert version == 3
+    assert "cluster_health" in tables
+    assert version == 4
     assert manager.integrity_check() == "ok"
 
 
@@ -75,12 +76,12 @@ def test_migration_failure_rollback(
     manager = DatabaseManager(str(db_path))
     manager.create_tables()
 
-    (migrations_dir / "004_fail.sql").write_text("THIS IS NOT VALID SQL;", encoding="utf-8")
+    (migrations_dir / "005_fail.sql").write_text("THIS IS NOT VALID SQL;", encoding="utf-8")
 
-    with pytest.raises(database.DatabaseError, match="004_fail.sql"):
+    with pytest.raises(database.DatabaseError, match="005_fail.sql"):
         manager.apply_pending_migrations()
 
-    backup = db_path.with_name(f"{db_path.name}.bak.3")
+    backup = db_path.with_name(f"{db_path.name}.bak.4")
     assert backup.is_file()
     assert manager.integrity_check() == "ok"
 
@@ -88,7 +89,7 @@ def test_migration_failure_rollback(
         version = connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
         ).fetchone()[0]
-    assert version == 3
+    assert version == 4
 
 
 def test_legacy_database_bootstraps_to_latest(
@@ -136,5 +137,5 @@ def test_legacy_database_bootstraps_to_latest(
         ).fetchone()[0]
 
     assert "has_faces" in photo_columns
-    assert version == 3
+    assert version == 4
     assert index_count >= 8

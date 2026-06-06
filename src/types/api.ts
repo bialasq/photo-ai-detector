@@ -35,7 +35,7 @@ export interface GalleryQueryParams {
   ai_filter: GalleryAiFilter;
 }
 
-export type ScanPhase = "idle" | "scanning" | "clustering";
+export type ScanPhase = "idle" | "scanning" | "clustering" | "cancelled";
 
 export interface ScanStatusResponse {
   processed: number;
@@ -44,6 +44,7 @@ export interface ScanStatusResponse {
   phase: ScanPhase;
   current_file: string | null;
   last_error: string | null;
+  cancelled?: boolean;
 }
 
 export interface ScanFolderResponse {

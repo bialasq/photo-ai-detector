@@ -7,7 +7,9 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent,
 } from "react";
+import { FixedSizeGrid, type GridChildComponentProps } from "react-window";
 import { Image, ImageOff, RefreshCw, X } from "lucide-react";
+import { LazyThumbnail } from "@/components/LazyThumbnail";
 import { PeopleGrid } from "@/components/PeopleGrid";
 import { useAppContext } from "@/context/AppContext";
 import * as api from "@/services/api";
@@ -19,6 +21,9 @@ import type {
 } from "@/types/api";
 
 const PHOTO_SKELETON_COUNT = 8;
+const VIRTUALIZE_THRESHOLD = 200;
+const GRID_CELL_SIZE = 180;
+const GRID_GAP = 16;
 
 const AI_FILTER_OPTIONS: ReadonlyArray<{
   value: GalleryAiFilter;
@@ -326,7 +331,7 @@ function PhotoCard({ photo, onOpen }: PhotoCardProps): JSX.Element {
       className="group relative aspect-square cursor-pointer overflow-hidden rounded-xl border border-slate-200 bg-slate-50 transition-all duration-200 hover:shadow-md"
     >
       {!imageLoadFailed ? (
-        <img
+        <LazyThumbnail
           src={thumbnailUrl}
           alt={`Photo ${photo.photo_id}: ${displayName}`}
           className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
@@ -350,6 +355,91 @@ function PhotoCard({ photo, onOpen }: PhotoCardProps): JSX.Element {
   );
 }
 
+interface VirtualizedPhotoGridProps {
+  photos: SearchResultItem[];
+  onOpenPhoto: (photoId: number) => void;
+}
+
+function VirtualizedPhotoGrid({
+  photos,
+  onOpenPhoto,
+}: VirtualizedPhotoGridProps): JSX.Element {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [gridSize, setGridSize] = useState<{ width: number; height: number }>({
+    width: 800,
+    height: 640,
+  });
+
+  useEffect(() => {
+    const element = containerRef.current;
+    if (element === null) {
+      return;
+    }
+
+    const observer = new ResizeObserver(([entry]) => {
+      if (entry === undefined) {
+        return;
+      }
+      setGridSize({
+        width: Math.max(GRID_CELL_SIZE, entry.contentRect.width),
+        height: Math.max(GRID_CELL_SIZE * 2, entry.contentRect.height),
+      });
+    });
+
+    observer.observe(element);
+    return () => {
+      observer.disconnect();
+    };
+  }, []);
+
+  const columnCount = Math.max(
+    1,
+    Math.floor((gridSize.width + GRID_GAP) / (GRID_CELL_SIZE + GRID_GAP)),
+  );
+  const rowCount = Math.ceil(photos.length / columnCount);
+
+  const renderCell = ({
+    columnIndex,
+    rowIndex,
+    style,
+  }: GridChildComponentProps): JSX.Element | null => {
+    const index = rowIndex * columnCount + columnIndex;
+    if (index >= photos.length) {
+      return null;
+    }
+
+    const photo = photos[index];
+    return (
+      <div
+        style={{
+          ...style,
+          left: Number(style.left) + GRID_GAP / 2,
+          top: Number(style.top) + GRID_GAP / 2,
+          width: Number(style.width) - GRID_GAP,
+          height: Number(style.height) - GRID_GAP,
+        }}
+      >
+        <PhotoCard photo={photo} onOpen={onOpenPhoto} />
+      </div>
+    );
+  };
+
+  return (
+    <div ref={containerRef} className="h-[min(70vh,820px)] w-full">
+      <FixedSizeGrid
+        columnCount={columnCount}
+        columnWidth={GRID_CELL_SIZE + GRID_GAP}
+        height={gridSize.height}
+        rowCount={rowCount}
+        rowHeight={GRID_CELL_SIZE + GRID_GAP}
+        width={gridSize.width}
+      >
+        {renderCell}
+      </FixedSizeGrid>
+    </div>
+  );
+}
+
 interface GalleryMainContentProps {
   photos: SearchResultItem[];
   isLoadingPhotos: boolean;
@@ -357,7 +447,7 @@ interface GalleryMainContentProps {
   onOpenPhoto: (photoId: number) => void;
 }
 
-function GalleryMainContent({
+export function GalleryMainContent({
   photos,
   isLoadingPhotos,
   error,
@@ -381,7 +471,11 @@ function GalleryMainContent({
 
       {showEmpty && <GalleryEmptyState />}
 
-      {showGrid && (
+      {showGrid && photos.length > VIRTUALIZE_THRESHOLD && (
+        <VirtualizedPhotoGrid photos={photos} onOpenPhoto={onOpenPhoto} />
+      )}
+
+      {showGrid && photos.length <= VIRTUALIZE_THRESHOLD && (
         <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4">
           {photos.map((photo) => (
             <PhotoCard

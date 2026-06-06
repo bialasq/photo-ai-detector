@@ -1,6 +1,7 @@
 import { FolderOpen, Image, Loader2, Users } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { Gallery } from "@/components/Gallery";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { PeopleIndex } from "@/components/PeopleIndex";
 import { ScanProgressOverlay } from "@/components/ScanProgressOverlay";
 import { useAppContext } from "@/context/AppContext";
@@ -24,9 +25,17 @@ export interface MainLayoutProps {
 
 function SectionContent({ section }: { section: NavSection }): JSX.Element {
   if (section === "gallery") {
-    return <Gallery />;
+    return (
+      <ErrorBoundary scope="gallery">
+        <Gallery />
+      </ErrorBoundary>
+    );
   }
-  return <PeopleIndex />;
+  return (
+    <ErrorBoundary scope="people">
+      <PeopleIndex />
+    </ErrorBoundary>
+  );
 }
 
 interface ScanFoldersButtonProps {

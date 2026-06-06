@@ -9,6 +9,7 @@ import {
   type ReactNode,
 } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
+import { cancelScan } from "@/api/scan";
 import * as api from "@/services/api";
 import {
   computeScanProgressPercent,
@@ -28,6 +29,7 @@ const IDLE_SCAN_STATUS: ScanStatusResponse = {
   phase: "idle",
   current_file: null,
   last_error: null,
+  cancelled: false,
 };
 
 function normalizeScanStatus(raw: ScanStatusResponse): ScanStatusResponse {
@@ -39,6 +41,7 @@ function normalizeScanStatus(raw: ScanStatusResponse): ScanStatusResponse {
     phase,
     current_file: raw.current_file ?? null,
     last_error: raw.last_error ?? null,
+    cancelled: raw.cancelled ?? false,
   };
 }
 
@@ -54,6 +57,7 @@ export interface AppContextValue {
   selectedPersonIds: number[];
   setSelectedPersonIds: React.Dispatch<React.SetStateAction<number[]>>;
   startFolderScan: () => Promise<void>;
+  cancelFolderScan: () => Promise<void>;
   simulateDevTestScan: () => Promise<void>;
   refreshAppData: () => void;
   clearScanActionError: () => void;
@@ -236,6 +240,29 @@ export function AppProvider({ children }: AppProviderProps): JSX.Element {
     beginScanPolling,
   ]);
 
+  const cancelFolderScan = useCallback(async (): Promise<void> => {
+    if (!isBackendAlive || !isScanning) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      "Stop the current scan? Photos already processed will be kept; remaining files stay unprocessed.",
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setScanActionError(null);
+
+    try {
+      await cancelScan();
+      setScanPollEnabled(true);
+      await pollScanStatusOnce();
+    } catch (cancelError: unknown) {
+      setScanActionError(api.getApiErrorMessage(cancelError));
+    }
+  }, [isBackendAlive, isScanning, pollScanStatusOnce]);
+
   const clearScanActionError = useCallback((): void => {
     setScanActionError(null);
   }, []);
@@ -276,6 +303,7 @@ export function AppProvider({ children }: AppProviderProps): JSX.Element {
       selectedPersonIds,
       setSelectedPersonIds,
       startFolderScan,
+      cancelFolderScan,
       simulateDevTestScan,
       refreshAppData,
       clearScanActionError,
@@ -291,6 +319,7 @@ export function AppProvider({ children }: AppProviderProps): JSX.Element {
       dataRefreshToken,
       selectedPersonIds,
       startFolderScan,
+      cancelFolderScan,
       simulateDevTestScan,
       refreshAppData,
       clearScanActionError,

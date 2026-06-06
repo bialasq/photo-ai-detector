@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { MainLayout } from "@/components/MainLayout";
 
 const BACKEND_HEALTH_URL = "http://127.0.0.1:8000/health";
@@ -85,5 +86,9 @@ export default function App(): JSX.Element {
     );
   }
 
-  return <MainLayout />;
+  return (
+    <ErrorBoundary scope="app">
+      <MainLayout />
+    </ErrorBoundary>
+  );
 }

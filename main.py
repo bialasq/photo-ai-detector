@@ -38,12 +38,13 @@ from pathlib import Path
 from typing import Any, Final, Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
 
+from path_validation import validate_scan_path
 from routes.v1 import router as v1_router
 from schemas import (
     DevSimulateScanRequest,
@@ -69,7 +70,9 @@ from database import (
     FaceRow,
     RecordNotFoundError,
     ValidationError,
+    get_app_data_dir,
 )
+from gpu import initialize_gpu_if_requested
 from errors import (
     ErrorCode,
     ErrorResponse,
@@ -203,7 +206,7 @@ class ScanStatusResponse(BaseModel):
     is_active: bool = Field(..., description="True while the background worker is running.")
     phase: str = Field(
         default="idle",
-        description="Worker phase: idle | scanning | clustering.",
+        description="Worker phase: idle | scanning | clustering | cancelled.",
     )
     current_file: Optional[str] = Field(
         default=None,
@@ -212,6 +215,10 @@ class ScanStatusResponse(BaseModel):
     last_error: Optional[str] = Field(
         default=None,
         description="Most recent per-file or clustering error message, if any.",
+    )
+    cancelled: bool = Field(
+        default=False,
+        description="True when the user stopped the scan before completion.",
     )
 
 
@@ -353,6 +360,7 @@ class ScanProgressState:
     total: int = 0
     is_active: bool = False
     phase: str = "idle"
+    cancelled: bool = False
     last_error: Optional[str] = None
     current_file: Optional[str] = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -365,9 +373,18 @@ class ScanProgressState:
                 "total": self.total,
                 "is_active": self.is_active,
                 "phase": self.phase,
+                "cancelled": self.cancelled,
                 "current_file": self.current_file,
                 "last_error": self.last_error,
             }
+
+    def is_cancelled(self) -> bool:
+        with self._lock:
+            return self.cancelled
+
+    def request_cancel(self) -> None:
+        with self._lock:
+            self.cancelled = True
 
     def try_begin_scan(self, total_files: int) -> bool:
         """
@@ -384,6 +401,7 @@ class ScanProgressState:
             self.total = total_files
             self.is_active = True
             self.phase = "scanning"
+            self.cancelled = False
             self.last_error = None
             self.current_file = None
             return True
@@ -406,10 +424,11 @@ class ScanProgressState:
         with self._lock:
             self.phase = phase
 
-    def finish_scan(self, *, error_message: Optional[str] = None) -> None:
+    def finish_scan(self, *, error_message: Optional[str] = None, cancelled: bool = False) -> None:
         with self._lock:
             self.is_active = False
-            self.phase = "idle"
+            self.phase = "cancelled" if cancelled else "idle"
+            self.cancelled = cancelled
             self.current_file = None
             if error_message is not None:
                 self.last_error = error_message
@@ -720,6 +739,7 @@ class AppServices:
     clustering: ClusteringEngine
     thumbnail_engine: ThumbnailEngine
     scan_state: ScanProgressState
+    vector_store: Any = None
     scan_task: Optional[asyncio.Task[None]] = None
     scan_task_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -772,35 +792,18 @@ def _is_blocked_scan_directory(directory: Path) -> bool:
     return False
 
 
-def resolve_and_validate_folder(folder_path: str) -> Path:
+def resolve_and_validate_folder(
+    folder_path: str,
+    *,
+    allow_whole_disk: bool = False,
+) -> Path:
     """
-    Resolve `folder_path` to an absolute directory on disk.
+    Resolve `folder_path` to an absolute directory on disk (task 1.2.3).
 
     Raises:
-        FileNotFoundError: Path does not exist.
-        NotADirectoryError: Path exists but is not a directory.
-        ValueError: Path is not a directory (generic fallback).
+        PathValidationError: Path fails security or shape checks.
     """
-    if "\0" in folder_path:
-        raise PathValidationError("folder_path contains null byte")
-
-    resolved = Path(folder_path).expanduser().resolve()
-
-    if not resolved.exists():
-        raise FileNotFoundError(f"Directory does not exist: {resolved}")
-
-    if not resolved.is_dir():
-        raise NotADirectoryError(f"Path is not a directory: {resolved}")
-
-    # Reject drive roots (e.g. C:\) — accidental full-disk scans are destructive.
-    normalized = str(resolved).rstrip("\\/")
-    drive, tail = os.path.splitdrive(normalized)
-    if drive and not tail.lstrip("\\/"):
-        raise PathValidationError(
-            f"Refusing to scan drive root {resolved}. Select a photo folder, not an entire disk.",
-        )
-
-    return resolved
+    return validate_scan_path(folder_path, allow_whole_disk=allow_whole_disk)
 
 
 def resolve_photo_source_path(file_path: str) -> Path:
@@ -1232,6 +1235,20 @@ def _ingest_detection_batch_sync(
         )
 
 
+def _persist_vector_store(services: AppServices) -> None:
+    """Rebuild and save the FAISS index after ingestion (tasks 2.2.1 / 2.2.2)."""
+    if services.vector_store is None:
+        return
+    try:
+        from vector_store import FaceVectorStore, get_faiss_index_path
+
+        services.vector_store = FaceVectorStore.rebuild_from_database(services.database)
+        index_path = get_faiss_index_path(get_app_data_dir())
+        services.vector_store.save(index_path)
+    except Exception as exc:  # noqa: BLE001 — index persistence must not fail scans
+        LOGGER.warning("Failed to persist FAISS index: %s", exc)
+
+
 def _run_clustering_sync(services: AppServices) -> None:
     """Execute DBSCAN incremental clustering in a worker thread."""
     result = services.clustering.run_incremental_clustering()
@@ -1277,6 +1294,13 @@ async def _execute_folder_scan_async(
         pending_batch: list[Path] = []
 
         for index, image_path in enumerate(image_files, start=1):
+            if scan_state.is_cancelled():
+                LOGGER.info(
+                    "Scan cancelled by user",
+                    extra={"ctx": {"event": "scan.cancelled"}},
+                )
+                break
+
             scan_state.set_current_file(str(image_path))
             resolved_path = _resolve_ingestion_file_path(image_path)
 
@@ -1301,6 +1325,13 @@ async def _execute_folder_scan_async(
 
             batch_paths = list(pending_batch)
             pending_batch.clear()
+
+            if scan_state.is_cancelled():
+                LOGGER.info(
+                    "Scan cancelled before batch processing",
+                    extra={"ctx": {"event": "scan.cancelled"}},
+                )
+                break
 
             try:
                 await asyncio.to_thread(
@@ -1334,7 +1365,7 @@ async def _execute_folder_scan_async(
             finally:
                 scan_state.increment_processed(len(batch_paths))
 
-        if pending_batch:
+        if pending_batch and not scan_state.is_cancelled():
             try:
                 await asyncio.to_thread(
                     _ingest_detection_batch_sync,
@@ -1349,6 +1380,23 @@ async def _execute_folder_scan_async(
                 scan_state.increment_processed(len(pending_batch))
 
         await asyncio.to_thread(face_buffer.flush)
+
+        if scan_state.is_cancelled():
+            snapshot = scan_state.snapshot()
+            LOGGER.info(
+                "Background scan cancelled (partial progress preserved)",
+                extra={
+                    "ctx": {
+                        "event": "scan.cancelled.complete",
+                        "processed": snapshot["processed"],
+                        "total": snapshot["total"],
+                    }
+                },
+            )
+            scan_state.finish_scan(cancelled=True)
+            return
+
+        _persist_vector_store(services)
 
         LOGGER.info(
             "Folder ingestion complete — starting incremental clustering",
@@ -1385,6 +1433,8 @@ async def _execute_folder_scan_async(
 async def start_folder_scan(
     services: AppServices,
     folder_path: str,
+    *,
+    allow_whole_disk: bool = False,
 ) -> ScanFolderResponse:
     """
     Validate folder, discover images, and launch the asyncio background scan task.
@@ -1393,7 +1443,10 @@ async def start_folder_scan(
         HTTPException: 409 if scan already active; 4xx/5xx on validation failures.
     """
     try:
-        folder = resolve_and_validate_folder(folder_path)
+        folder = resolve_and_validate_folder(
+            folder_path,
+            allow_whole_disk=allow_whole_disk,
+        )
         image_files = discover_image_files_recursively(folder)
     except Exception as exc:  # noqa: BLE001
         raise_http_exception_from_error(exc)
@@ -1490,6 +1543,7 @@ async def lifespan(application: FastAPI):
         )
 
     verify_ai_runtime_dependencies()
+    initialize_gpu_if_requested()
 
     database = DatabaseManager()
     database.create_tables()
@@ -1504,12 +1558,24 @@ async def lifespan(application: FastAPI):
     thumbnail_engine = ThumbnailEngine(cache_dir=THUMBNAIL_CACHE_DIR)
     scan_state = ScanProgressState()
 
+    vector_store = None
+    try:
+        from vector_store import FaceVectorStore, get_faiss_index_path
+
+        vector_store = FaceVectorStore.load_or_rebuild(
+            get_faiss_index_path(get_app_data_dir()),
+            database,
+        )
+    except RuntimeError as exc:
+        LOGGER.warning("FAISS vector store unavailable: %s", exc)
+
     _services = AppServices(
         database=database,
         ai_engine=ai_engine,
         clustering=clustering,
         thumbnail_engine=thumbnail_engine,
         scan_state=scan_state,
+        vector_store=vector_store,
     )
 
     application.state.services = _services
@@ -1619,7 +1685,10 @@ def register_routes(application: FastAPI, *, dev_mode: bool | None = None) -> No
         tags=["scan"],
         summary="Start background folder ingestion + clustering",
     )
-    async def post_scan_folder(request_body: ScanFolderRequest) -> ScanFolderResponse:
+    async def post_scan_folder(
+        request: Request,
+        request_body: ScanFolderRequest,
+    ) -> ScanFolderResponse:
         """
         Recursively scan a local folder for JPG/PNG images.
 
@@ -1628,9 +1697,11 @@ def register_routes(application: FastAPI, *, dev_mode: bool | None = None) -> No
         """
         try:
             services = get_services()
+            allow_whole_disk = request.headers.get("X-Confirm-Whole-Disk") == "1"
             return await start_folder_scan(
                 services=services,
                 folder_path=request_body.folder_path,
+                allow_whole_disk=allow_whole_disk,
             )
         except HTTPException:
             raise
@@ -1663,6 +1734,7 @@ def register_routes(application: FastAPI, *, dev_mode: bool | None = None) -> No
                 phase=str(snapshot.get("phase") or "idle"),
                 current_file=snapshot.get("current_file"),
                 last_error=snapshot.get("last_error"),
+                cancelled=bool(snapshot.get("cancelled")),
             )
         except HTTPException:
             raise

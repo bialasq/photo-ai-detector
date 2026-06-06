@@ -35,12 +35,12 @@ def assert_error_contract(
     assert "hint" in body
 
 
-def test_scan_folder_missing_directory_not_found(api_client: TestClient) -> None:
+def test_scan_folder_missing_directory_path_invalid(api_client: TestClient) -> None:
     response = api_client.post(
         "/api/scan-folder",
         json={"folder_path": "Z:\\definitely-not-a-real-folder-12345"},
     )
-    assert_error_contract(response, status_code=404, code=ErrorCode.NOT_FOUND)
+    assert_error_contract(response, status_code=400, code=ErrorCode.PATH_INVALID)
 
 
 def test_search_empty_names_validation_error(api_client: TestClient) -> None:

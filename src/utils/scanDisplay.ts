@@ -32,6 +32,19 @@ export function computeScanProgressPercent(status: ScanStatusResponse): number {
 export function deriveScanProgressDisplay(
   status: ScanStatusResponse,
 ): ScanProgressDisplay | null {
+  if (status.phase === "cancelled" || status.cancelled) {
+    if (!status.is_active) {
+      return null;
+    }
+    return {
+      phase: "cancelled",
+      title: "Stopping scan…",
+      detail: "Finishing the current batch before saving progress.",
+      percent: computeScanProgressPercent(status),
+      indeterminate: true,
+    };
+  }
+
   if (!status.is_active && !isScanPhaseActive(status.phase)) {
     return null;
   }

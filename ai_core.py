@@ -24,6 +24,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -31,6 +32,7 @@ from typing import Any, Final, Optional, Sequence, Union
 
 import numpy as np
 from sklearn.cluster import DBSCAN
+from sklearn.metrics import davies_bouldin_score, silhouette_score
 
 from database import (
     DEFAULT_FACE_INSERT_BATCH_SIZE,
@@ -320,6 +322,8 @@ class ClusteringRunResult:
     auto_assigned_faces: int = 0
     boundary_faces_queued: int = 0
     pending_cluster_ids: list[int] = field(default_factory=list)
+    silhouette: Optional[float] = None
+    davies_bouldin: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +350,72 @@ def _as_float_vector(values: Sequence[float], *, name: str = "vector") -> np.nda
         raise EmbeddingError(f"{name} contains NaN or Inf")
 
     return array
+
+
+def incremental_assign(
+    embedding: Sequence[float] | np.ndarray,
+    *,
+    vector_store: Any,
+    database: DatabaseManager,
+    threshold: float | None = None,
+    k: int = 5,
+) -> Optional[int]:
+    """
+    Assign a new face embedding to an existing cluster via FAISS top-k search.
+
+    Returns a ``cluster_id`` only when all above-threshold neighbours share the
+    same named cluster; mixed or weak matches return ``None`` (pending DBSCAN).
+    """
+    if threshold is None:
+        raw_threshold = os.environ.get("PHOTO_ORGANIZER_INCREMENTAL_THRESHOLD", "0.7")
+        try:
+            threshold = float(raw_threshold)
+        except ValueError as exc:
+            raise ValueError(
+                "PHOTO_ORGANIZER_INCREMENTAL_THRESHOLD must be a float"
+            ) from exc
+    threshold = max(0.5, threshold)
+
+    candidates = vector_store.search(embedding, k=k)
+    valid = [(face_id, similarity) for face_id, similarity in candidates if similarity > threshold]
+    if not valid:
+        return None
+
+    cluster_ids: list[int] = []
+    for face_id, _similarity in valid:
+        face = database.get_face_by_id(face_id)
+        if face is None or face.cluster_id is None or face.cluster_id < 0:
+            continue
+        cluster_ids.append(face.cluster_id)
+
+    if not cluster_ids:
+        return None
+
+    unique_clusters = set(cluster_ids)
+    if len(unique_clusters) == 1:
+        return cluster_ids[0]
+    return None
+
+
+def _compute_cluster_quality_metrics(
+    embedding_matrix: np.ndarray,
+    labels: np.ndarray,
+) -> tuple[Optional[float], Optional[float], int]:
+    """Return silhouette, Davies-Bouldin, and named cluster count (excludes noise)."""
+    named_mask = labels >= 0
+    named_labels = labels[named_mask]
+    unique_named = set(int(label) for label in named_labels)
+    n_clusters = len(unique_named)
+
+    if n_clusters < 2:
+        return None, None, n_clusters
+
+    named_embeddings = embedding_matrix[named_mask]
+    silhouette = float(
+        silhouette_score(named_embeddings, named_labels, metric="cosine")
+    )
+    db_score = float(davies_bouldin_score(named_embeddings, named_labels))
+    return silhouette, db_score, n_clusters
 
 
 def l2_normalize(vector: Sequence[float]) -> list[float]:
@@ -1284,6 +1354,36 @@ class ClusteringEngine:
             len(valid_faces),
             sorted(set(int(label) for label in labels)),
         )
+
+        silhouette, db_score, n_clusters = _compute_cluster_quality_metrics(
+            embedding_matrix,
+            labels,
+        )
+        result.silhouette = silhouette
+        result.davies_bouldin = db_score
+
+        LOGGER.info(
+            "Cluster quality metrics",
+            extra={
+                "ctx": {
+                    "phase": "clustering",
+                    "silhouette": silhouette,
+                    "db_score": db_score,
+                    "n_clusters": n_clusters,
+                    "eps": eps,
+                }
+            },
+        )
+
+        try:
+            self.database.insert_cluster_health(
+                silhouette=silhouette,
+                db_score=db_score,
+                n_clusters=n_clusters,
+                eps=eps,
+            )
+        except Exception as exc:  # noqa: BLE001 — metrics must not abort clustering
+            LOGGER.warning("Failed to persist cluster health metrics: %s", exc)
 
         resolution = self._resolve_dbscan_labels(valid_faces, labels)
 
