@@ -27,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 import logging
 import math
 import os
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -587,6 +588,8 @@ def _import_deepface() -> Any:
     Raises:
         FaceDetectionError: If deepface is not installed or incompatible with TensorFlow.
     """
+    import keras_legacy_env  # noqa: F401 — before tf_keras / tensorflow (TD-5)
+
     try:
         import tf_keras  # noqa: F401 — required by retinaface on TensorFlow 2.21+
     except ImportError as exc:
@@ -765,6 +768,8 @@ class AICoreEngine:
         self.align = align
         self._active_detector_backend: Optional[str] = None
         self._deepface: Any = None
+        self._probe_lock = threading.Lock()
+        self._inference_lock = threading.Lock()
 
         LOGGER.info(
             "AICoreEngine initialized model=%s enforce_detection=%s align=%s",
@@ -780,19 +785,28 @@ class AICoreEngine:
 
     def reset_runtime(self) -> None:
         """
-        Clear cached DeepFace import and detector probe state.
+        Clear cached DeepFace import only (e.g. after dependency upgrade in dev).
 
-        Call before a new folder scan so dependency upgrades or transient import
-        failures in a long-running uvicorn process do not stick across scans.
+        Does **not** reset the selected detector backend — re-probing during an
+        active scan races TensorFlow model builds and can crash the sidecar.
         """
         self._deepface = None
-        self._active_detector_backend = None
-        LOGGER.info("AICoreEngine runtime cache cleared")
+        LOGGER.info("AICoreEngine DeepFace import cache cleared")
 
     @property
     def active_detector_backend(self) -> Optional[str]:
         """Currently selected detector backend after probe, or None before first use."""
         return self._active_detector_backend
+
+    def ensure_detector_backend_ready(self) -> str:
+        """
+        Run the detector probe once before parallel batch detection.
+
+        Prevents ``ThreadPoolExecutor`` workers from racing to build RetinaFace /
+        TensorFlow models simultaneously when a folder scan starts.
+        """
+        probe_image = np.zeros((64, 64, 3), dtype=np.uint8)
+        return self._probe_detector_backend(probe_image)
 
     def _validate_image_path(self, file_path: str) -> Path:
         """
@@ -835,48 +849,52 @@ class AICoreEngine:
         if self._active_detector_backend is not None:
             return self._active_detector_backend
 
-        DeepFace = self._get_deepface()
-        last_error: Optional[Exception] = None
+        with self._probe_lock:
+            if self._active_detector_backend is not None:
+                return self._active_detector_backend
 
-        for backend in SUPPORTED_DETECTOR_BACKENDS:
-            try:
-                LOGGER.info("Probing DeepFace detector backend '%s'...", backend)
+            DeepFace = self._get_deepface()
+            last_error: Optional[Exception] = None
+
+            for backend in SUPPORTED_DETECTOR_BACKENDS:
                 try:
-                    DeepFace.represent(
-                        img_path=image,
-                        model_name=self.model_name,
-                        detector_backend=backend,
-                        enforce_detection=False,
-                        align=self.align,
-                    )
-                except (ValueError, MemoryError) as exc:
-                    LOGGER.error(
-                        "DeepFace.represent failed during detector probe for backend %s: %s",
+                    LOGGER.info("Probing DeepFace detector backend '%s'...", backend)
+                    try:
+                        DeepFace.represent(
+                            img_path=image,
+                            model_name=self.model_name,
+                            detector_backend=backend,
+                            enforce_detection=False,
+                            align=self.align,
+                        )
+                    except (ValueError, MemoryError) as exc:
+                        LOGGER.error(
+                            "DeepFace.represent failed during detector probe for backend %s: %s",
+                            backend,
+                            exc,
+                            exc_info=True,
+                        )
+                        raise EmbeddingError(
+                            f"embedding failed during detector probe for backend {backend}",
+                            context={"path": "<in-memory-probe>"},
+                        ) from exc
+                    self._active_detector_backend = backend
+                    LOGGER.info("Selected detector backend '%s'", backend)
+                    return backend
+                except Exception as exc:  # noqa: BLE001 — probe must catch all DeepFace/backend failures
+                    last_error = exc
+                    LOGGER.warning(
+                        "Probe backendu '%s' nie powiódł się: %s: %s",
                         backend,
+                        type(exc).__name__,
                         exc,
-                        exc_info=True,
                     )
-                    raise EmbeddingError(
-                        f"embedding failed during detector probe for backend {backend}",
-                        context={"path": "<in-memory-probe>"},
-                    ) from exc
-                self._active_detector_backend = backend
-                LOGGER.info("Selected detector backend '%s'", backend)
-                return backend
-            except Exception as exc:  # noqa: BLE001 — probe must catch all DeepFace/backend failures
-                last_error = exc
-                LOGGER.warning(
-                    "Probe backendu '%s' nie powiódł się: %s: %s",
-                    backend,
-                    type(exc).__name__,
-                    exc,
-                )
 
-        LOGGER.error("Probe backendu nie powiódł się (żaden backend): %s", last_error)
-        raise FaceDetectionError(
-            f"No usable detector backend among {SUPPORTED_DETECTOR_BACKENDS}. "
-            f"Last error: {last_error}"
-        ) from last_error
+            LOGGER.error("Probe backendu nie powiódł się (żaden backend): %s", last_error)
+            raise FaceDetectionError(
+                f"No usable detector backend among {SUPPORTED_DETECTOR_BACKENDS}. "
+                f"Last error: {last_error}"
+            ) from last_error
 
     def process_image(self, image_path: str | Path) -> list[dict[str, Any]]:
         """
@@ -901,62 +919,63 @@ class AICoreEngine:
 
         img = _load_image_bgr(image_path)
 
-        try:
-            detector_backend = self._probe_detector_backend(img)
-
-            DeepFace = self._get_deepface()
+        with self._inference_lock:
             try:
-                raw_result = DeepFace.represent(
-                    img_path=img,
-                    model_name=self.model_name,
+                detector_backend = self._probe_detector_backend(img)
+
+                DeepFace = self._get_deepface()
+                try:
+                    raw_result = DeepFace.represent(
+                        img_path=img,
+                        model_name=self.model_name,
+                        detector_backend=detector_backend,
+                        enforce_detection=self.enforce_detection,
+                        align=self.align,
+                    )
+                except (ValueError, MemoryError) as exc:
+                    LOGGER.error(
+                        "DeepFace.represent failed for %s: %s",
+                        image_path,
+                        exc,
+                        exc_info=True,
+                    )
+                    raise EmbeddingError(
+                        f"embedding failed for {image_path}",
+                        context={"path": str(image_path)},
+                    ) from exc
+
+                detected_faces = _parse_deepface_represent_result(
+                    raw_result,
                     detector_backend=detector_backend,
-                    enforce_detection=self.enforce_detection,
-                    align=self.align,
+                    model_name=self.model_name,
                 )
-            except (ValueError, MemoryError) as exc:
-                LOGGER.error(
-                    "DeepFace.represent failed for %s: %s",
+
+                if not detected_faces:
+                    LOGGER.info("No faces detected in image: %s", image_path)
+                    return []
+
+                payload = [face.to_dict() for face in detected_faces]
+                LOGGER.info(
+                    "Detected %s face(s) in %s using backend=%s model=%s",
+                    len(payload),
                     image_path,
-                    exc,
-                    exc_info=True,
+                    detector_backend,
+                    self.model_name,
                 )
-                raise EmbeddingError(
-                    f"embedding failed for {image_path}",
-                    context={"path": str(image_path)},
-                ) from exc
+                return payload
 
-            detected_faces = _parse_deepface_represent_result(
-                raw_result,
-                detector_backend=detector_backend,
-                model_name=self.model_name,
-            )
-
-            if not detected_faces:
-                LOGGER.info("No faces detected in image: %s", image_path)
+            except (FileNotFoundError, ValueError):
+                raise
+            except FaceDetectionError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — production boundary for third-party CV stack
+                LOGGER.exception(
+                    "Face processing failed for %s: %s: %s",
+                    image_path,
+                    type(exc).__name__,
+                    exc,
+                )
                 return []
-
-            payload = [face.to_dict() for face in detected_faces]
-            LOGGER.info(
-                "Detected %s face(s) in %s using backend=%s model=%s",
-                len(payload),
-                image_path,
-                detector_backend,
-                self.model_name,
-            )
-            return payload
-
-        except (FileNotFoundError, ValueError):
-            raise
-        except FaceDetectionError:
-            raise
-        except Exception as exc:  # noqa: BLE001 — production boundary for third-party CV stack
-            LOGGER.exception(
-                "Face processing failed for %s: %s: %s",
-                image_path,
-                type(exc).__name__,
-                exc,
-            )
-            return []
 
 
     def detect_faces_batch(
@@ -981,13 +1000,11 @@ class AICoreEngine:
             return []
 
         LOGGER.info(
-            "Batch face detection: images=%s workers=%s",
+            "Batch face detection: images=%s workers=1",
             len(paths),
-            DETECTION_THREAD_WORKERS,
         )
 
-        with ThreadPoolExecutor(max_workers=DETECTION_THREAD_WORKERS) as executor:
-            return list(executor.map(self.process_image, paths))
+        return [self.process_image(path) for path in paths]
 
     def detect_faces_batch_with_retry(
         self,

@@ -1481,7 +1481,7 @@ async def start_folder_scan(
                 code=ErrorCode.SCAN_IN_PROGRESS,
             )
 
-        services.ai_engine.reset_runtime()
+        await asyncio.to_thread(services.ai_engine.ensure_detector_backend_ready)
 
         services.scan_task = asyncio.create_task(
             _execute_folder_scan_async(
@@ -1556,6 +1556,16 @@ async def lifespan(application: FastAPI):
         raise SystemExit(1) from exc
 
     ai_engine = AICoreEngine()
+    try:
+        detector_backend = await asyncio.to_thread(ai_engine.ensure_detector_backend_ready)
+    except FaceDetectionError as exc:
+        LOGGER.error("Sidecar startup aborted: detector probe failed: %s", exc)
+        raise SystemExit(1) from exc
+    LOGGER.info(
+        "Detector backend ready at startup",
+        extra={"ctx": {"event": "detector.ready", "backend": detector_backend}},
+    )
+
     clustering = ClusteringEngine(database=database)
     thumbnail_engine = ThumbnailEngine(cache_dir=THUMBNAIL_CACHE_DIR)
     scan_state = ScanProgressState()

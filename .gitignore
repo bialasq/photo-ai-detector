@@ -83,3 +83,23 @@ diff-stat.txt
 
 _ai_core_*.db
 _ai_core_*.db.bak.*
+
+organizer.db
+organizer.db-wal
+organizer.db-shm
+organizer.db.bak.*
+
+organizer.db
+organizer.db-wal
+organizer.db-shm
+organizer.db.bak.*
+
+organizer.db
+organizer.db-wal
+organizer.db-shm
+organizer.db.bak.*
+
+organizer.db
+organizer.db-wal
+organizer.db-shm
+organizer.db.bak.*

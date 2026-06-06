@@ -6,6 +6,8 @@ Default is CPU-only. Set ``PHOTO_ORGANIZER_GPU=1`` to enable CUDA when available
 
 from __future__ import annotations
 
+import keras_legacy_env  # noqa: F401 — before tensorflow (TD-5)
+
 import logging
 import os
 from typing import Any
