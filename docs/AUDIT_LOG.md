@@ -25,6 +25,7 @@ potwierdzony — Faza 2 może budować na tym bezpiecznie.
 | TD-2 | packaging (task 4.x) | NIE pakować `docs/api/openapi.json` do MSI — zawiera pełen schemat API włącznie z `/api/dev/*`. | med (przed release) |
 | TD-3 | `database.create_tables` legacy bootstrap | Podwójne źródło prawdy o schemacie: legacy `_apply_migrations` (ALTER) vs pliki `001/002.sql`. Mogą się rozsynchronizować przy przyszłej zmianie schematu. | med |
 | TD-4 | `tests/integration/test_dev_endpoints.py` | `reset-library` test kasuje DB — brak asercji że `db_path` zawiera `tmp` (gdyby ktoś usunął fixturę, kasowałby prawdziwą bazę). | low |
+| TD-5 | ai_core RetinaFace detector | RetinaFace nie buduje się na TF 2.21/Keras 3 (`KerasTensor`/`tf.shape` w retinaface_model.py). Probe cicho spada na OpenCV (słabszy recall). PRODUKCJA używa OpenCV mimo że RetinaFace jest "primary". Wykryte przez live-ai benchmark. | **HIGH** — dotyczy jakości detekcji całego produktu |
 
 ## NIE audytowane (zrobione solo, ale nie-krytyczne — do przeglądu gdy Luq wróci)
 
