@@ -33,6 +33,7 @@ import logging
 import mimetypes
 import os
 import threading
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from io import BytesIO
@@ -222,6 +223,13 @@ class ScanStatusResponse(BaseModel):
         default=False,
         description="True when the user stopped the scan before completion.",
     )
+    eta_seconds: float | None = Field(
+        default=None,
+        description=(
+            "Estimated seconds until scan ingestion completes; null when unknown "
+            "(idle, clustering, or no real files processed yet)."
+        ),
+    )
 
 
 class SearchResultItem(BaseModel):
@@ -365,11 +373,56 @@ class ScanProgressState:
     cancelled: bool = False
     last_error: Optional[str] = None
     current_file: Optional[str] = None
+    started_at: float | None = None
+    actually_processed: int = 0
+    first_real_process_at: float | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    @staticmethod
+    def _compute_eta_seconds(
+        *,
+        is_active: bool,
+        phase: str,
+        processed: int,
+        total: int,
+        actually_processed: int,
+        first_real_process_at: float | None,
+    ) -> float | None:
+        """
+        Estimate seconds until ingestion completes.
+
+        ETA is intentionally conservative: it may overestimate when skipped and
+        new files are interleaved, because underestimating progress is worse UX
+        than a slightly long wait.
+        """
+        if not is_active or phase != "scanning":
+            return None
+
+        if processed == 0 or actually_processed == 0 or first_real_process_at is None:
+            return None
+
+        remaining = total - processed
+        if remaining <= 0:
+            return 0.0
+
+        elapsed = time.monotonic() - first_real_process_at
+        if elapsed <= 0:
+            return None
+
+        rate = elapsed / actually_processed
+        return round(rate * remaining, 1)
 
     def snapshot(self) -> dict[str, Any]:
         """Return a consistent copy for API responses."""
         with self._lock:
+            eta_seconds = self._compute_eta_seconds(
+                is_active=self.is_active,
+                phase=self.phase,
+                processed=self.processed,
+                total=self.total,
+                actually_processed=self.actually_processed,
+                first_real_process_at=self.first_real_process_at,
+            )
             return {
                 "processed": self.processed,
                 "total": self.total,
@@ -378,6 +431,7 @@ class ScanProgressState:
                 "cancelled": self.cancelled,
                 "current_file": self.current_file,
                 "last_error": self.last_error,
+                "eta_seconds": eta_seconds,
             }
 
     def is_cancelled(self) -> bool:
@@ -406,6 +460,9 @@ class ScanProgressState:
             self.cancelled = False
             self.last_error = None
             self.current_file = None
+            self.started_at = time.monotonic()
+            self.actually_processed = 0
+            self.first_real_process_at = None
             return True
 
     def set_total(self, total_files: int) -> None:
@@ -417,6 +474,14 @@ class ScanProgressState:
             return
         with self._lock:
             self.processed += count
+
+    def increment_actually_processed(self, count: int = 1) -> None:
+        if count <= 0:
+            return
+        with self._lock:
+            if self.first_real_process_at is None:
+                self.first_real_process_at = time.monotonic()
+            self.actually_processed += count
 
     def set_current_file(self, file_path: Optional[str]) -> None:
         with self._lock:
@@ -1366,6 +1431,7 @@ async def _execute_folder_scan_async(
                 scan_state.last_error = f"{image_path.name}: {exc}"
             finally:
                 scan_state.increment_processed(len(batch_paths))
+                scan_state.increment_actually_processed(len(batch_paths))
 
         if pending_batch and not scan_state.is_cancelled():
             try:
@@ -1380,6 +1446,7 @@ async def _execute_folder_scan_async(
                 scan_state.last_error = str(exc)
             finally:
                 scan_state.increment_processed(len(pending_batch))
+                scan_state.increment_actually_processed(len(pending_batch))
 
         await asyncio.to_thread(face_buffer.flush)
 
@@ -1747,6 +1814,7 @@ def register_routes(application: FastAPI, *, dev_mode: bool | None = None) -> No
                 current_file=snapshot.get("current_file"),
                 last_error=snapshot.get("last_error"),
                 cancelled=bool(snapshot.get("cancelled")),
+                eta_seconds=snapshot.get("eta_seconds"),
             )
         except HTTPException:
             raise
