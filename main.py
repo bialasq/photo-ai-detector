@@ -29,9 +29,11 @@ import keras_legacy_env  # noqa: F401 — before ai_core / tensorflow (TD-5)
 
 import asyncio
 import hashlib
+import json
 import logging
 import mimetypes
 import os
+import shutil
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -155,7 +157,11 @@ EXCLUDED_SCAN_DIR_NAMES: Final[frozenset[str]] = frozenset(
     }
 )
 
-THUMBNAIL_CACHE_DIR: Final[Path] = PROJECT_ROOT / ".thumbnail_cache"
+THUMBNAIL_CACHE_SUBDIR: Final[str] = "thumbnails"
+THUMBNAIL_CACHE_INDEX_FILENAME: Final[str] = ".lru_index.json"
+THUMBNAIL_CACHE_MB_ENV_VAR: Final[str] = "PHOTO_ORGANIZER_THUMB_CACHE_MB"
+THUMBNAIL_CACHE_MAX_BYTES_DEFAULT: Final[int] = 500 * 1024 * 1024
+LEGACY_THUMBNAIL_CACHE_DIR: Final[Path] = PROJECT_ROOT / ".thumbnail_cache"
 THUMBNAIL_DEFAULT_WIDTH: Final[int] = 300
 THUMBNAIL_JPEG_QUALITY: Final[int] = 85
 THUMBNAIL_MIN_EDGE: Final[int] = 1
@@ -501,6 +507,35 @@ class ScanProgressState:
                 self.last_error = error_message
 
 
+def resolve_thumbnail_cache_dir() -> Path:
+    """Writable thumbnail cache under application data (``…/thumbnails``)."""
+    return get_app_data_dir() / THUMBNAIL_CACHE_SUBDIR
+
+
+def _thumbnail_cache_max_bytes() -> int:
+    raw = os.environ.get(THUMBNAIL_CACHE_MB_ENV_VAR, "").strip()
+    if not raw:
+        return THUMBNAIL_CACHE_MAX_BYTES_DEFAULT
+    try:
+        megabytes = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{THUMBNAIL_CACHE_MB_ENV_VAR} must be a positive integer"
+        ) from exc
+    if megabytes <= 0:
+        raise ValueError(f"{THUMBNAIL_CACHE_MB_ENV_VAR} must be a positive integer")
+    return megabytes * 1024 * 1024
+
+
+def _remove_legacy_thumbnail_cache_dir() -> None:
+    if LEGACY_THUMBNAIL_CACHE_DIR.is_dir():
+        LOGGER.info(
+            "Removing legacy project-root thumbnail cache: %s",
+            LEGACY_THUMBNAIL_CACHE_DIR,
+        )
+        shutil.rmtree(LEGACY_THUMBNAIL_CACHE_DIR, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # Thumbnail engine — disk cache + Pillow downscaling
 # ---------------------------------------------------------------------------
@@ -510,14 +545,165 @@ class ThumbnailEngine:
     """
     Local JPEG thumbnail cache with SHA-256 keys derived from source path and geometry.
 
-    Cache directory: `.thumbnail_cache/` at project root (created on startup).
+    Cache directory: ``%AppData%/com.photo.organizer/thumbnails`` (LRU eviction, 500 MB default).
     """
 
-    def __init__(self, cache_dir: Path) -> None:
+    def __init__(self, cache_dir: Path, *, max_bytes: int | None = None) -> None:
         self.cache_dir: Path = cache_dir.resolve()
+        self._max_bytes = max_bytes if max_bytes is not None else _thumbnail_cache_max_bytes()
         self._io_lock = threading.Lock()
+        self._index_path = self.cache_dir / THUMBNAIL_CACHE_INDEX_FILENAME
+        self._access_index: dict[str, dict[str, float | int]] = {}
+        self._total_bytes = 0
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        LOGGER.info("ThumbnailEngine cache directory: %s", self.cache_dir)
+        self._load_or_rebuild_index()
+        LOGGER.info(
+            "ThumbnailEngine cache directory: %s (max_bytes=%s entries=%s)",
+            self.cache_dir,
+            self._max_bytes,
+            len(self._access_index),
+        )
+
+    def _load_or_rebuild_index(self) -> None:
+        if self._index_path.is_file():
+            try:
+                payload = json.loads(self._index_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                LOGGER.warning("Corrupt thumbnail LRU index, rebuilding from disk: %s", exc)
+                self._rebuild_index_from_disk()
+                return
+            entries = payload.get("entries")
+            if not isinstance(entries, dict):
+                LOGGER.warning("Invalid thumbnail LRU index shape, rebuilding from disk")
+                self._rebuild_index_from_disk()
+                return
+            self._access_index = {
+                str(name): {
+                    "size_bytes": int(entry["size_bytes"]),
+                    "last_access": float(entry["last_access"]),
+                }
+                for name, entry in entries.items()
+                if isinstance(entry, dict)
+                and "size_bytes" in entry
+                and "last_access" in entry
+            }
+            self._sync_index_with_disk()
+            return
+        self._rebuild_index_from_disk()
+
+    def _rebuild_index_from_disk(self) -> None:
+        self._access_index = {}
+        self._total_bytes = 0
+        for cache_path in sorted(self.cache_dir.glob("*.jpg")):
+            try:
+                stat_result = cache_path.stat()
+            except OSError:
+                continue
+            self._access_index[cache_path.name] = {
+                "size_bytes": stat_result.st_size,
+                "last_access": stat_result.st_mtime,
+            }
+        self._recalculate_total_bytes()
+
+    def _sync_index_with_disk(self) -> None:
+        on_disk = {path.name for path in self.cache_dir.glob("*.jpg")}
+        for name in list(self._access_index):
+            if name not in on_disk:
+                del self._access_index[name]
+        for cache_path in self.cache_dir.glob("*.jpg"):
+            if cache_path.name in self._access_index:
+                continue
+            try:
+                stat_result = cache_path.stat()
+            except OSError:
+                continue
+            self._access_index[cache_path.name] = {
+                "size_bytes": stat_result.st_size,
+                "last_access": stat_result.st_mtime,
+            }
+        self._recalculate_total_bytes()
+
+    def _recalculate_total_bytes(self) -> None:
+        self._total_bytes = sum(
+            int(entry["size_bytes"]) for entry in self._access_index.values()
+        )
+
+    def _touch_access_locked(self, cache_name: str) -> None:
+        """Update ``last_access`` for a cache hit; caller must hold ``_io_lock``."""
+        entry = self._access_index.get(cache_name)
+        if entry is not None:
+            entry["last_access"] = time.time()
+            return
+        cache_path = self.cache_dir / cache_name
+        if not cache_path.is_file():
+            return
+        try:
+            stat_result = cache_path.stat()
+        except OSError:
+            return
+        self._access_index[cache_name] = {
+            "size_bytes": stat_result.st_size,
+            "last_access": time.time(),
+        }
+        self._total_bytes += stat_result.st_size
+
+    def _touch_cache_hit(self, cache_path: Path) -> None:
+        with self._io_lock:
+            self._touch_access_locked(cache_path.name)
+
+    def _record_cache_write(self, cache_path: Path) -> None:
+        """Register a new or replaced cache file and evict if over limit; caller holds lock."""
+        try:
+            size = cache_path.stat().st_size
+        except OSError as exc:
+            LOGGER.warning("Cannot stat new thumbnail %s: %s", cache_path.name, exc)
+            return
+        name = cache_path.name
+        previous = self._access_index.pop(name, None)
+        if previous is not None:
+            self._total_bytes -= int(previous["size_bytes"])
+        now = time.time()
+        self._access_index[name] = {"size_bytes": size, "last_access": now}
+        self._total_bytes += size
+        self._evict_if_needed()
+
+    def _evict_if_needed(self) -> None:
+        """Remove least-recently-used entries until within limit; caller holds ``_io_lock``."""
+        if self._total_bytes <= self._max_bytes:
+            return
+        evicted = False
+        for name, entry in sorted(
+            self._access_index.items(),
+            key=lambda item: float(item[1]["last_access"]),
+        ):
+            if self._total_bytes <= self._max_bytes:
+                break
+            cache_path = self.cache_dir / name
+            try:
+                cache_path.unlink(missing_ok=True)
+            except OSError as exc:
+                LOGGER.warning("Failed to evict thumbnail %s: %s", name, exc)
+                continue
+            self._total_bytes -= int(entry["size_bytes"])
+            del self._access_index[name]
+            evicted = True
+            LOGGER.debug("Evicted thumbnail cache entry: %s", name)
+        if evicted:
+            self._persist_index()
+
+    def _persist_index(self) -> None:
+        payload = {"version": 1, "entries": self._access_index}
+        temp_path = self._index_path.with_suffix(".json.tmp")
+        temp_path.write_text(
+            json.dumps(payload, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        temp_path.replace(self._index_path)
+
+    def close(self) -> None:
+        """Flush the in-memory LRU index to disk (lifespan shutdown)."""
+        with self._io_lock:
+            self._persist_index()
 
     @staticmethod
     def _sanitize_cache_filename(digest_hex: str) -> str:
@@ -686,10 +872,12 @@ class ThumbnailEngine:
         )
 
         if cache_path.is_file():
+            self._touch_cache_hit(cache_path)
             return cache_path
 
         with self._io_lock:
             if cache_path.is_file():
+                self._touch_access_locked(cache_path.name)
                 return cache_path
 
             self._generate_face_thumbnail_file(
@@ -698,6 +886,7 @@ class ThumbnailEngine:
                 bounding_box=bounding_box,
                 width=width,
             )
+            self._record_cache_write(cache_path)
 
         return cache_path
 
@@ -753,17 +942,19 @@ class ThumbnailEngine:
             height: Optional maximum height; aspect ratio preserved when omitted.
 
         Returns:
-            Absolute path to a JPEG file inside `.thumbnail_cache/`.
+            Absolute path to a JPEG file inside the AppData thumbnail cache.
         """
         cache_path = self.build_cache_path(source_path, width=width, height=height)
 
         if cache_path.is_file():
             LOGGER.debug("Thumbnail cache hit: %s", cache_path.name)
+            self._touch_cache_hit(cache_path)
             return cache_path
 
         with self._io_lock:
             if cache_path.is_file():
                 LOGGER.debug("Thumbnail cache hit after lock: %s", cache_path.name)
+                self._touch_access_locked(cache_path.name)
                 return cache_path
 
             LOGGER.info(
@@ -777,6 +968,7 @@ class ThumbnailEngine:
                 width=width,
                 height=height,
             )
+            self._record_cache_write(cache_path)
 
         return cache_path
 
@@ -1634,7 +1826,8 @@ async def lifespan(application: FastAPI):
     )
 
     clustering = ClusteringEngine(database=database)
-    thumbnail_engine = ThumbnailEngine(cache_dir=THUMBNAIL_CACHE_DIR)
+    _remove_legacy_thumbnail_cache_dir()
+    thumbnail_engine = ThumbnailEngine(cache_dir=resolve_thumbnail_cache_dir())
     scan_state = ScanProgressState()
 
     vector_store = None
@@ -1678,6 +1871,7 @@ async def lifespan(application: FastAPI):
                     await _services.scan_task
                 except asyncio.CancelledError:
                     pass
+        _services.thumbnail_engine.close()
 
     _services = None
 
