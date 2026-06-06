@@ -25,6 +25,8 @@ Architecture:
 
 from __future__ import annotations
 
+import keras_legacy_env  # noqa: F401 — before ai_core / tensorflow (TD-5)
+
 import asyncio
 import hashlib
 import logging

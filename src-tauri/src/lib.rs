@@ -289,7 +289,8 @@ fn apply_sidecar_env(
         .env("PHOTO_ORGANIZER_HOST", BACKEND_HOST)
         .env("PHOTO_ORGANIZER_PORT", BACKEND_PORT)
         .env(DB_PATH_ENV, db_path.display().to_string())
-        .env("PYTHONNOUSERSITE", "1");
+        .env("PYTHONNOUSERSITE", "1")
+        .env("TF_USE_LEGACY_KERAS", "1");
 
     #[cfg(debug_assertions)]
     {

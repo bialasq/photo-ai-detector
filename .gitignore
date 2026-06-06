@@ -80,3 +80,6 @@ roadmap-bundle/
 audit-*.txt
 pytest-out.txt
 diff-stat.txt
+
+_ai_core_*.db
+_ai_core_*.db.bak.*

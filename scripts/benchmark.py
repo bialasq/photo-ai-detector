@@ -13,21 +13,35 @@ Example:
 
 from __future__ import annotations
 
+import importlib.util
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parents[1]
+_legacy_spec = importlib.util.spec_from_file_location(
+    "keras_legacy_env", _ROOT / "keras_legacy_env.py"
+)
+if _legacy_spec is None or _legacy_spec.loader is None:
+    raise ImportError(f"keras_legacy_env.py not found at {_ROOT}")
+_legacy_module = importlib.util.module_from_spec(_legacy_spec)
+_legacy_spec.loader.exec_module(_legacy_module)
+
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+import keras_legacy_env  # noqa: F401 — before ai_core / tensorflow (TD-5)
+
 import argparse
 import json
 import platform
 import random
 import subprocess
-import sys
 import time
 import tracemalloc
 from dataclasses import asdict, dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+ROOT = _ROOT
 
 DATASET_SIZES = {"1k": 1_000, "5k": 5_000, "10k": 10_000}
 FIXTURE_ROOT = ROOT / "tests" / "fixtures" / "benchmarks"

@@ -21,6 +21,8 @@ Pipeline overview:
 
 from __future__ import annotations
 
+import keras_legacy_env  # noqa: F401 — before tf_keras / tensorflow (TD-5)
+
 from concurrent.futures import ThreadPoolExecutor
 import logging
 import math
