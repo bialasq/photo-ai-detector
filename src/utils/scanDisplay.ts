@@ -6,6 +6,7 @@ export interface ScanProgressDisplay {
   detail: string;
   percent: number;
   indeterminate: boolean;
+  etaLabel: string | null;
 }
 
 function basename(filePath: string): string {
@@ -17,6 +18,21 @@ function basename(filePath: string): string {
 
 export function isScanPhaseActive(phase: ScanPhase): boolean {
   return phase === "scanning" || phase === "clustering";
+}
+
+export function formatScanEtaRemaining(
+  etaSeconds: number | null | undefined,
+): string | null {
+  if (etaSeconds === null || etaSeconds === undefined || etaSeconds <= 0) {
+    return null;
+  }
+  if (etaSeconds >= 3600) {
+    return ">1 h remaining";
+  }
+  if (etaSeconds < 60) {
+    return `~${Math.ceil(etaSeconds)} s remaining`;
+  }
+  return `~${Math.round(etaSeconds / 60)} min remaining`;
 }
 
 export function computeScanProgressPercent(status: ScanStatusResponse): number {
@@ -42,6 +58,7 @@ export function deriveScanProgressDisplay(
       detail: "Finishing the current batch before saving progress.",
       percent: computeScanProgressPercent(status),
       indeterminate: true,
+      etaLabel: null,
     };
   }
 
@@ -59,6 +76,7 @@ export function deriveScanProgressDisplay(
           : "Grouping detected faces into people clusters…",
       percent: 100,
       indeterminate: true,
+      etaLabel: null,
     };
   }
 
@@ -78,11 +96,19 @@ export function deriveScanProgressDisplay(
     }
   }
 
+  const etaLabel =
+    status.phase === "scanning" &&
+    status.eta_seconds !== null &&
+    status.eta_seconds > 0
+      ? formatScanEtaRemaining(status.eta_seconds)
+      : null;
+
   return {
     phase: "scanning",
     title: "Scanning images",
     detail,
     percent: computeScanProgressPercent(status),
     indeterminate: total === 0,
+    etaLabel,
   };
 }

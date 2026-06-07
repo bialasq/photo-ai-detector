@@ -45,6 +45,7 @@ export interface ScanStatusResponse {
   current_file: string | null;
   last_error: string | null;
   cancelled?: boolean;
+  eta_seconds: number | null;
 }
 
 export interface ScanFolderResponse {

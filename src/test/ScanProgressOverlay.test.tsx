@@ -13,6 +13,7 @@ vi.mock("@/context/AppContext", () => ({
       detail: "Processing photo 1 of 10",
       percent: 10,
       indeterminate: false,
+      etaLabel: null,
     },
     scanStatus: {
       processed: 1,
@@ -22,6 +23,7 @@ vi.mock("@/context/AppContext", () => ({
       current_file: "a.jpg",
       last_error: null,
       cancelled: false,
+      eta_seconds: null,
     },
     scanActionError: null,
     isScanning: true,

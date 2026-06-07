@@ -43,6 +43,11 @@ export function ScanProgressOverlay(): JSX.Element | null {
                 <p className="mt-0.5 truncate text-sm text-slate-400">
                   {scanDisplay.detail}
                 </p>
+                {scanDisplay.etaLabel !== null && (
+                  <p className="mt-0.5 text-xs text-slate-400">
+                    {scanDisplay.etaLabel}
+                  </p>
+                )}
               </div>
               {!scanDisplay.indeterminate && (
                 <span className="shrink-0 text-sm font-semibold tabular-nums text-sky-300">

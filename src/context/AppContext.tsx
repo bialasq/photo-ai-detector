@@ -30,6 +30,7 @@ const IDLE_SCAN_STATUS: ScanStatusResponse = {
   current_file: null,
   last_error: null,
   cancelled: false,
+  eta_seconds: null,
 };
 
 function normalizeScanStatus(raw: ScanStatusResponse): ScanStatusResponse {
@@ -42,6 +43,7 @@ function normalizeScanStatus(raw: ScanStatusResponse): ScanStatusResponse {
     current_file: raw.current_file ?? null,
     last_error: raw.last_error ?? null,
     cancelled: raw.cancelled ?? false,
+    eta_seconds: raw.eta_seconds ?? null,
   };
 }
 
