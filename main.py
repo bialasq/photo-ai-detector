@@ -45,7 +45,8 @@ from typing import Any, Final, Optional
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
 
@@ -82,6 +83,7 @@ from errors import (
     ErrorCode,
     ErrorResponse,
     PathValidationError,
+    error_response_dict,
     raise_api_error,
     register_exception_handlers,
 )
@@ -118,6 +120,8 @@ def _resolve_project_root() -> Path:
 PROJECT_ROOT: Final[Path] = _resolve_project_root()
 DEFAULT_HOST: Final[str] = "127.0.0.1"
 DEFAULT_PORT: Final[int] = 8000
+PHOTO_ORGANIZER_PORT_ENV_VAR: Final[str] = "PHOTO_ORGANIZER_PORT"
+EXTRA_ALLOWED_HOSTS_ENV_VAR: Final[str] = "PHOTO_ORGANIZER_EXTRA_ALLOWED_HOSTS"
 
 LOOPBACK_BIND_HOSTS: Final[frozenset[str]] = frozenset({"127.0.0.1", "localhost", "::1"})
 
@@ -1909,6 +1913,77 @@ async def lifespan(application: FastAPI):
     _services = None
 
 
+def _resolve_sidecar_port() -> int:
+    """Return the sidecar listen port from ``PHOTO_ORGANIZER_PORT`` or ``DEFAULT_PORT``."""
+    bind_port_raw = os.environ.get(
+        PHOTO_ORGANIZER_PORT_ENV_VAR, str(DEFAULT_PORT)
+    ).strip()
+    try:
+        port = int(bind_port_raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"PHOTO_ORGANIZER_PORT must be an integer, got {bind_port_raw!r}"
+        ) from exc
+    if port <= 0 or port > 65535:
+        raise ValueError(
+            f"PHOTO_ORGANIZER_PORT must be between 1 and 65535, got {port}"
+        )
+    return port
+
+
+def _parse_extra_allowed_hosts() -> frozenset[str]:
+    """Optional comma-separated Host values (tests only — never set in production)."""
+    extra = os.environ.get(EXTRA_ALLOWED_HOSTS_ENV_VAR, "").strip()
+    if not extra:
+        return frozenset()
+    return frozenset(
+        segment.strip().lower()
+        for segment in extra.split(",")
+        if segment.strip()
+    )
+
+
+def _build_allowed_hosts(port: int) -> frozenset[str]:
+    """Loopback Host header values permitted for the given listen port."""
+    return frozenset(
+        {
+            f"127.0.0.1:{port}",
+            f"localhost:{port}",
+            f"[::1]:{port}",
+        }
+    )
+
+
+def _allowed_hosts_for_request() -> frozenset[str]:
+    """Production loopback hosts plus optional extra allowlist from env."""
+    return _build_allowed_hosts(_resolve_sidecar_port()) | _parse_extra_allowed_hosts()
+
+
+class LoopbackHostMiddleware(BaseHTTPMiddleware):
+    """Reject HTTP requests whose Host header is not loopback for the sidecar port."""
+
+    async def dispatch(self, request: Request, call_next):  # type: ignore[no-untyped-def]
+        host = request.headers.get("host", "").strip().lower()
+        if host not in _allowed_hosts_for_request():
+            LOGGER.warning(
+                "Rejected request with invalid Host header",
+                extra={
+                    "ctx": {
+                        "event": "host.rejected",
+                        "host_hash": hash_path_for_log(host or "missing"),
+                    }
+                },
+            )
+            return JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content=error_response_dict(
+                    error="Invalid Host header",
+                    code=ErrorCode.VALIDATION_ERROR,
+                ),
+            )
+        return await call_next(request)
+
+
 def assert_loopback_bind_host(host: str) -> str:
     """
     Validate that the sidecar binds only to a loopback interface.
@@ -1953,6 +2028,8 @@ def create_application(*, dev_mode: bool | None = None) -> FastAPI:
         allow_headers=["*"],
         max_age=600,
     )
+    # Outermost middleware (added last): reject invalid Host before CORS or route handlers.
+    application.add_middleware(LoopbackHostMiddleware)
 
     register_exception_handlers(application)
 
@@ -2838,11 +2915,4 @@ def run_server(
 if __name__ == "__main__":
     setup_logging(level=os.environ.get("PHOTO_ORGANIZER_LOG_LEVEL", "INFO"))
     bind_host = os.environ.get("PHOTO_ORGANIZER_HOST", DEFAULT_HOST).strip() or DEFAULT_HOST
-    bind_port_raw = os.environ.get("PHOTO_ORGANIZER_PORT", str(DEFAULT_PORT)).strip()
-    try:
-        bind_port = int(bind_port_raw)
-    except ValueError as exc:
-        raise ValueError(
-            f"PHOTO_ORGANIZER_PORT must be an integer, got {bind_port_raw!r}"
-        ) from exc
-    run_server(host=bind_host, port=bind_port)
+    run_server(host=bind_host, port=_resolve_sidecar_port())

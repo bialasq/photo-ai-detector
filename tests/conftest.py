@@ -43,6 +43,12 @@ def isolated_app_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setenv("PHOTO_ORGANIZER_APP_DATA", str(tmp_path / "pytest-app-data"))
 
 
+@pytest.fixture(autouse=True)
+def allow_testserver_host_for_testclient(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TestClient sends ``Host: testserver``; allow only under pytest via extra env."""
+    monkeypatch.setenv("PHOTO_ORGANIZER_EXTRA_ALLOWED_HOSTS", "testserver")
+
+
 @pytest.fixture
 def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
     """TestClient with isolated DB and without TensorFlow / detector probe at startup."""
