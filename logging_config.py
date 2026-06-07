@@ -11,7 +11,6 @@ Override directories for tests or custom installs:
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -22,6 +21,7 @@ from pathlib import Path
 from typing import Any, Final
 
 from database import get_app_data_dir
+from log_privacy import hash_path_for_log
 
 DEV_MODE_ENV_VAR: Final[str] = "PHOTO_ORGANIZER_DEV"
 APP_DATA_ENV_VAR: Final[str] = "PHOTO_ORGANIZER_APP_DATA"
@@ -60,19 +60,6 @@ def get_log_dir() -> Path:
 
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
-
-
-def hash_path_for_log(path: str | Path | None) -> str:
-    """
-    Return a stable short hash of a filesystem path for INFO-level logs (privacy).
-
-    Full paths must not appear at INFO; use this helper or log at ERROR with care.
-    """
-    if path is None:
-        return "none"
-    normalized = str(Path(path).expanduser().resolve())
-    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-    return digest[:16]
 
 
 class JsonLogFormatter(logging.Formatter):

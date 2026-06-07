@@ -47,6 +47,7 @@ from database import (
     PersonRow,
     ValidationError,
 )
+from log_privacy import hash_path_for_log
 
 # ---------------------------------------------------------------------------
 # Optional OpenCV — lazy import (smoke tests / clustering work without cv2)
@@ -915,7 +916,15 @@ class AICoreEngine:
             - Pozostałe błędy DeepFace: log + zwraca ``[]`` (bezpieczne dla pipeline).
         """
         image_path = self._validate_image_path(str(image_path))
-        LOGGER.info("Processing image: %s", image_path)
+        LOGGER.info(
+            "Processing image",
+            extra={
+                "ctx": {
+                    "event": "ai.process_image",
+                    "path_hash": hash_path_for_log(image_path),
+                }
+            },
+        )
 
         img = _load_image_bgr(image_path)
 
@@ -934,9 +943,14 @@ class AICoreEngine:
                     )
                 except (ValueError, MemoryError) as exc:
                     LOGGER.error(
-                        "DeepFace.represent failed for %s: %s",
-                        image_path,
-                        exc,
+                        "DeepFace.represent failed",
+                        extra={
+                            "ctx": {
+                                "event": "ai.deepface.failed",
+                                "path_hash": hash_path_for_log(image_path),
+                                "error": str(exc),
+                            }
+                        },
                         exc_info=True,
                     )
                     raise EmbeddingError(
@@ -951,7 +965,15 @@ class AICoreEngine:
                 )
 
                 if not detected_faces:
-                    LOGGER.info("No faces detected in image: %s", image_path)
+                    LOGGER.info(
+                        "No faces detected in image",
+                        extra={
+                            "ctx": {
+                                "event": "ai.no_faces",
+                                "path_hash": hash_path_for_log(image_path),
+                            }
+                        },
+                    )
                     return []
 
                 payload = [face.to_dict() for face in detected_faces]

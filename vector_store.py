@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Protocol
 import numpy as np
 
 from database import EXPECTED_EMBEDDING_DIMENSION, DatabaseManager
+from log_privacy import hash_path_for_log
 
 if TYPE_CHECKING:
     import faiss
@@ -100,7 +101,16 @@ class FaceVectorStore:
         faiss.write_index(self.index, str(path))
         ids_path = path.with_suffix(FAISS_IDS_SUFFIX)
         ids_path.write_bytes(pickle.dumps(self.face_ids))
-        LOGGER.info("Saved FAISS index (%s vectors) to %s", len(self.face_ids), path)
+        LOGGER.info(
+            "Saved FAISS index",
+            extra={
+                "ctx": {
+                    "event": "faiss.save",
+                    "vector_count": len(self.face_ids),
+                    "path_hash": hash_path_for_log(path),
+                }
+            },
+        )
 
     def load(self, path: Path) -> None:
         faiss = _import_faiss()
@@ -118,7 +128,16 @@ class FaceVectorStore:
             raise ValueError(
                 f"FAISS index size {self.index.ntotal} != id map length {len(self.face_ids)}"
             )
-        LOGGER.info("Loaded FAISS index (%s vectors) from %s", len(self.face_ids), path)
+        LOGGER.info(
+            "Loaded FAISS index",
+            extra={
+                "ctx": {
+                    "event": "faiss.load",
+                    "vector_count": len(self.face_ids),
+                    "path_hash": hash_path_for_log(path),
+                }
+            },
+        )
 
     @classmethod
     def rebuild_from_database(cls, database: DatabaseManager) -> FaceVectorStore:

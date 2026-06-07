@@ -33,6 +33,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Generator, Iterable, Optional, Sequence
 
+from log_privacy import hash_path_for_log
+
 # ---------------------------------------------------------------------------
 # Module constants
 # ---------------------------------------------------------------------------
@@ -1082,7 +1084,15 @@ class DatabaseManager:
 
         self.apply_pending_migrations()
 
-        LOGGER.info("Database schema initialized at %s", self.db_path)
+        LOGGER.info(
+            "Database schema initialized",
+            extra={
+                "ctx": {
+                    "event": "database.schema.init",
+                    "path_hash": hash_path_for_log(self.db_path),
+                }
+            },
+        )
 
     def database_exists(self) -> bool:
         """Return True if the database file is present on disk."""
