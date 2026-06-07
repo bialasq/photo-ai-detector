@@ -58,7 +58,7 @@
 | V1.1 | Documented trust boundaries | ✅ | This document; `main.py` module docstring (L1–24) | Desktop UI → loopback HTTP → sidecar → SQLite/files |
 | V1.2 | Components communicate securely for context | N/A | Loopback HTTP only | No inter-service WAN; Tauri WebView → `127.0.0.1:8000` |
 | V1.4 | Server only binds intended network interfaces | ✅ | `main.py::assert_loopback_bind_host` (L1879–1895); `LOOPBACK_BIND_HOSTS` (L122); `run_server` calls assert before uvicorn (L2791–2798) | Non-loopback host → `ValueError`; integration test `tests/integration/test_bind_loopback.py::test_uvicorn_subprocess_binds_loopback_only` |
-| V1.5 | HTTP middleware validates Host (DNS rebinding) | ⚠️ **GAP** | No Host-check middleware in `main.py::create_application` (L1898–1928) | CORS (`CORSMiddleware` L1914–1922) does not validate `Host`. **Remediation: task 3.1.2** |
+| V1.5 | HTTP middleware validates Host (DNS rebinding) | ✅ **Remediated** | `main.py::LoopbackHostMiddleware` (L2031+); registered in `create_application` (L2112); tests: `tests/integration/test_dns_rebinding.py` | **Task [3.1.2](../tasks/phase-3/3.1.2-dns-rebinding-mitigation-host-header-check.md)** — closed. Optional `PHOTO_ORGANIZER_EXTRA_ALLOWED_HOSTS` for pytest `Host: testserver`. |
 | V1.14 | Untrusted sources cannot reach admin/dev interfaces | ✅ | `logging_config.py::is_dev_mode` (L37–46); `main.py::register_dev_routes` gated (L2712–2713); `create_application` disables docs when not dev (L1900–1911) | Release: `PHOTO_ORGANIZER_DEV` unset → no `/api/dev/*`, no `/docs` |
 | V1.x | CORS restricted to local/Tauri origins | ✅ | `main.py::ALLOWED_CORS_ORIGINS` (L175–186); `ALLOWED_CORS_ORIGIN_REGEX` (L188–193) | Allows `tauri://localhost`, `127.0.0.1:*`, Vite dev ports — appropriate for desktop shell |
 
@@ -135,7 +135,7 @@
 | V7.1 | Errors do not leak stack traces to client | ✅ | `errors.py::unhandled_exception_handler` (L238–248) returns generic `"Internal server error"`; `ErrorResponse.details` docstring: "never contains stack traces" (L72–74) | Stack in `JsonLogFormatter` `exc` field **server log only** (L95–96) |
 | V7.1 | Domain errors mapped to stable JSON | ✅ | `errors.py::register_exception_handlers` (L252–259); `main.py::raise_http_exception_from_error` (L1331–1417) | `PathValidationError` → 400 `PATH_INVALID` |
 | V7.2 | Security events logged | ✅ | Structured JSON logs via `logging_config.py::JsonLogFormatter`; scan events use `ctx` + `hash_path_for_log` (`main.py` L1218–1227) | Rotating file under AppData `logs/backend.log` |
-| V7.3 | Logs avoid sensitive data (paths/PII) | ⚠️ **GAP** | `logging_config.py::hash_path_for_log` (L65–75) used in scan/path validation; **but** `main.py::ThumbnailEngine.get_or_create_thumbnail` logs plaintext `source_path` at INFO (L960–963); `ScanProgressState.set_current_file` stores full path (L492–494), exposed via `GET /api/scan-status` snapshot (L438, L1563) | Inconsistent with hashing policy; user folder names (often surnames) leak to logs and API. **New remediation task (P1)** — see GAP register |
+| V7.3 | Logs avoid sensitive data (paths/PII) | ✅ **Remediated** | `log_privacy.py::hash_path_for_log`; thumbnail/scan logs use hashes or basenames; `ScanProgressState.snapshot()` exposes basename for `current_file`; tests: `tests/test_pii_path_privacy.py` | **GAP-003** — task 3.1.x path privacy (merged). Gallery/search still return `file_path` by design (desktop open-in-OS). |
 | V7.4 | Validation errors sanitized | ✅ | `errors.py::validation_exception_handler` (L164–184) | Pydantic `ctx` values stringified |
 
 ---
@@ -147,7 +147,7 @@
 | V8.1 | User data location documented | ✅ | `database.py::get_app_data_dir` (L61–90); `logging_config.py` module docstring (L4–9) | Windows: `%AppData%\com.photo.organizer` |
 | V8.2 | Biometric embeddings handling | **N/A** (see V6) | Stored as BLOB in `faces.embedding`; **not** returned in REST JSON models (`FacePreviewItem` has bbox + URLs only, `main.py` L257–267) | Embeddings stay server-side; UI gets thumbnails by ID |
 | V8.2 | Face embeddings in API responses | ✅ | No endpoint returns raw `embedding` vectors in response models | Search/gallery return `photo_id` + `file_path` only |
-| V8.3 | Filesystem paths in API | ⚠️ **GAP** (PII) | `SearchResultItem.file_path` (L241–245); gallery/search handlers (e.g. L2047, L2112); `ScanStatusResponse.current_file` doc says "Basename" (L220–222) but code sets full path (L1563) | Intentional for desktop file opening, but conflicts with privacy docstring and hashing elsewhere. **Same P1 task as V7.3** |
+| V8.3 | Filesystem paths in API | ⚠️ **Partial** | `SearchResultItem.file_path` intentional for desktop; `ScanStatusResponse.current_file` returns **basename** only (GAP-003 remediated) | Gallery/search full paths remain accepted for v1 — see conscious decisions |
 | V8.3 | Path hashes in error details | ✅ | `path_validation.py` details `path_hash` only (L21–25); tests assert Windows not in error body (`tests/test_path_validation.py::test_api_rejects_traversal_path`) | |
 
 ---
@@ -200,7 +200,7 @@
 | V13.2 | Content-Type / method restrictions | ✅ | FastAPI defaults; CORS methods `GET, POST, OPTIONS` only (L1919) | |
 | V13.4 | Admin/dev API disabled in production | ✅ | `is_dev_mode` + conditional `register_dev_routes` (L2712); Tauri release builds should not set `PHOTO_ORGANIZER_DEV=1` (`src-tauri/src/lib.rs` sets only in debug ~L298) | |
 | V13.4 | OpenAPI / Swagger disabled in release | ✅ | `create_application` sets `docs_url`, `redoc_url`, `openapi_url` to `None` when not dev (L1909–1911); `tests/integration/test_api_docs.py` | |
-| V13.5 | Host header validation | ⚠️ **GAP** | Same as V1.5 | **Task 3.1.2** |
+| V13.5 | Host header validation | ✅ **Remediated** | Same as V1.5 — `LoopbackHostMiddleware` | **Task 3.1.2** — closed |
 
 ---
 
@@ -229,15 +229,15 @@
 
 | Category | ✅ | ⚠️ GAP | N/A |
 |----------|---:|-------:|----:|
-| V1 Architecture | 3 | 1 | 1 |
+| V1 Architecture | 4 | 0 | 1 |
 | V2–V4 Auth / session / access | 1 | 0 | 6+ |
 | V5 Validation | 10 | 1 | 0 |
 | V6 Crypto | 1 | 0 | 1 |
-| V7 Errors & logging | 3 | 1 | 0 |
+| V7 Errors & logging | 4 | 0 | 0 |
 | V8 Data protection | 3 | 1 | 1 |
 | V9–V11 Comm / malicious / logic | 2 | 1 | 4+ |
 | V12 Files | 4 | 1 | 0 |
-| V13 API | 4 | 1 | 0 |
+| V13 API | 5 | 0 | 0 |
 | V14 Config | 3 | 1 | 0 |
 
 **Release gate (3.1.1):** All ⚠️ items have assigned remediation tasks below. This audit does **not** implement fixes.
@@ -248,9 +248,9 @@
 
 | Priority | GAP ID | Description | Evidence | Remediation task |
 |----------|--------|-------------|----------|------------------|
-| **P1** | GAP-001 | **DNS rebinding:** no `Host` header validation; malicious page could script requests to `127.0.0.1:8000` with attacker `Host`. | `main.py::create_application` — no host middleware | **[3.1.2](../tasks/phase-3/3.1.2-dns-rebinding-mitigation-host-header-check.md)** DNS rebinding mitigation |
+| **P1** | GAP-001 | **DNS rebinding:** no `Host` header validation; malicious page could script requests to `127.0.0.1:8000` with attacker `Host`. | `main.py::LoopbackHostMiddleware` | ✅ **Remediated** — **[3.1.2](../tasks/phase-3/3.1.2-dns-rebinding-mitigation-host-header-check.md)** (`tests/integration/test_dns_rebinding.py`) |
 | **P1** | GAP-002 | **Scan symlink sandbox escape:** after valid scan root, `os.walk` + `.resolve()` can ingest files **outside** the user-selected folder via nested symlinks. | `main.py::discover_image_files_recursively` (L1197–1209); `path_validation.py` only checks root (L80–85) | **[3.1.4](../tasks/phase-3/3.1.4-path-validation-hardening-symlink-rejection.md)** — per-file `is_relative_to(scan_root)` or don't follow symlinks in walk |
-| **P1** | GAP-003 | **PII path leakage (logs + API):** plaintext filesystem paths at INFO and in scan status, inconsistent with `hash_path_for_log`. | `main.py::ThumbnailEngine.get_or_create_thumbnail` (L960–963); `ScanProgressState.set_current_file` (L492–494, L1563); `GET /api/scan-status` returns `current_file` (L2008); doc mismatch L220–222 | **New task (proposed):** `3.1.x-logging-api-path-privacy` — use `hash_path_for_log` / basename in logs; align `current_file` with doc or hash; audit other INFO logs |
+| **P1** | GAP-003 | **PII path leakage (logs + API):** plaintext filesystem paths at INFO and in scan status, inconsistent with `hash_path_for_log`. | `log_privacy.py`; hashed paths in logs; basename in `GET /api/scan-status` | ✅ **Remediated** — path privacy hardening (`tests/test_pii_path_privacy.py`, `tests/test_scan_last_error_sanitization.py`) |
 | **P2** | GAP-004 | **`last_error` in scan-status** may surface raw exception strings from ingestion/clustering to the WebView. | `ScanProgressState.last_error` (L224–227); `finish_scan(error_message=str(exc))` (L1688, L1762) | **New task (proposed):** sanitize user-facing scan errors (stable codes + safe message) |
 | **P2** | GAP-005 | **Dependency vulnerability scanning** in CI (`security-audit` job: `pip-audit` + `npm audit`, warning-only). | `.github/workflows/ci.yml` — `continue-on-error: true`; does **not** fail PR | **[3.1.5](../tasks/phase-3/3.1.5-pip-audit-npm-audit-w-ci-warning-only.md)** — **Remediated (warning-only)**. **Note:** `pip-audit -r` audits **declared** requirement ranges, not the installed production venv; resolved versions may differ from a real `pip install` (conscious speed vs. precision trade-off while scans remain non-blocking). |
 | **P3** | GAP-006 | **Security headers / CSP** for Tauri WebView + sidecar HTTP responses. | `main.py::SecurityHeadersMiddleware`; `src-tauri/tauri.conf.json` | **[3.1.3](../tasks/phase-3/3.1.3-security-headers-csp-w-tauri-webview-x-content-type-options.md)** — **Remediated.** **CSP notes:** (1) Tauri exposes only enforcing `csp` (no native report-only) — validate in WebView DevTools after changes. (2) `img-src` **must** include `http://127.0.0.1:8000` / `http://localhost:8000` — gallery loads thumbnails/full JPEG from sidecar `<img src>`, not `connect-src`. (3) `style-src 'unsafe-inline'` — required for React `style={{…}}` and `react-window` cell layout. (4) `script-src 'unsafe-eval'` — kept for `tauri dev` + Vite HMR; production Vite bundle uses external `.js` only (candidate to drop in follow-up after manual verification). |
@@ -260,7 +260,7 @@
 | Topic | Decision | Rationale |
 |-------|----------|-----------|
 | **Embeddings encryption at rest** | N/A — no SQLCipher/DPAPI for v1 | Single-user offline; AppData ACL; attacker with AppData access has originals — see V6/V8 |
-| **No authentication on localhost API** | N/A | Trust OS user + loopback; mitigated by bind + (pending) Host check |
+| **No authentication on localhost API** | N/A | Trust OS user + loopback; mitigated by bind + Host check (3.1.2) |
 | **Full `file_path` in gallery/search API** | Accepted for v1 desktop | Required to open files in OS shell; document in privacy notes; optional future: serve by `photo_id` only in UI |
 
 ---

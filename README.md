@@ -11,26 +11,54 @@
 | **Backend** | Python 3.12, FastAPI, SQLite, DeepFace, TensorFlow, scikit-learn |
 | **Desktop shell** | Tauri 2, React 18, TypeScript, Vite, Tailwind CSS |
 | **Default API** | `http://127.0.0.1:8000` (loopback only) |
-| **Database** | `organizer.db` (created locally, not committed) |
+| **Database & cache** | `%AppData%\com.photo.organizer\` (`organizer.db`, `thumbnails/`, `logs/`) — not in repo root |
+
+**Documentation:** [Architecture](docs/ARCHITECTURE.md) · [Security audit](docs/SECURITY_AUDIT.md) · [Contributing](CONTRIBUTING.md) · [API error codes](docs/API_ERROR_CODES.md)
+
+---
+
+## Quick start
+
+**What it is:** Offline Windows desktop app (Tauri 2 + React) with a local Python FastAPI sidecar. Scan folders, detect faces, cluster unknown people, browse the gallery — all on CPU, no cloud.
+
+**Requirements:** Windows 10/11 x64, **Python 3.12**, **Node.js 20**, Rust (rustup), ~4 GB RAM. **GPU:** not used in normal Windows builds — TensorFlow runs **CPU-only** (see [Known limitations](#known-limitations-gpu--scan-time) below).
+
+```powershell
+cd C:\path\to\photo-ai-detector
+py -3.12 -m venv venv
+.\venv\Scripts\Activate.ps1
+$env:PYTHONNOUSERSITE = "1"
+python -m pip install --upgrade pip
+python -m pip install --no-cache-dir --no-user -r requirements.txt
+npm install
+run_app.bat
+```
+
+`run_app.bat` starts uvicorn in a separate window, then `npm run tauri:dev`. Alternative: backend only with `python -m uvicorn main:app --host 127.0.0.1 --port 8000`, or full details in [Running the application](#running-the-application).
+
+**Security (summary):** Sidecar binds loopback only; `LoopbackHostMiddleware` validates `Host` (DNS rebinding); Tauri WebView CSP + backend `SecurityHeadersMiddleware`. Details: [docs/SECURITY_AUDIT.md](docs/SECURITY_AUDIT.md).
 
 ---
 
 ## Table of contents (English)
 
-1. [Product overview](#product-overview)
-2. [Features](#features)
-3. [Architecture](#architecture)
-4. [End-to-end development lifecycle](#end-to-end-development-lifecycle)
-5. [Repository layout](#repository-layout)
-6. [Prerequisites](#prerequisites)
-7. [Python environment (3.12)](#python-environment-312)
-8. [Frontend & Tauri setup](#frontend--tauri-setup)
-9. [Running the application](#running-the-application)
-10. [HTTP API reference](#http-api-reference)
-11. [Release build & sidecar packaging](#release-build--sidecar-packaging)
-12. [Environment variables](#environment-variables)
-13. [Data, privacy & `.gitignore`](#data-privacy--gitignore)
-14. [Troubleshooting](#troubleshooting)
+1. [Quick start](#quick-start)
+2. [Product overview](#product-overview)
+3. [Features](#features)
+4. [Known limitations (GPU & scan time)](#known-limitations-gpu--scan-time)
+5. [Architecture](#architecture)
+6. [End-to-end development lifecycle](#end-to-end-development-lifecycle)
+7. [Repository layout](#repository-layout)
+8. [Prerequisites](#prerequisites)
+9. [Python environment (3.12)](#python-environment-312)
+10. [Frontend & Tauri setup](#frontend--tauri-setup)
+11. [Running the application](#running-the-application)
+12. [Running tests](#running-tests)
+13. [HTTP API reference](#http-api-reference)
+14. [Release build & sidecar packaging](#release-build--sidecar-packaging)
+15. [Environment variables](#environment-variables)
+16. [Data, privacy & `.gitignore`](#data-privacy--gitignore)
+17. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -56,6 +84,14 @@ The project is a **monorepo at the repository root**: Python modules (`main.py`,
 
 ---
 
+## Known limitations (GPU & scan time)
+
+- **CPU-only on Windows (default):** TensorFlow 2.11+ does **not** ship native GPU wheels for Windows. The app uses CPU inference; a folder scan can take **minutes** on large libraries — this is expected, not a bug.
+- **Optional GPU:** Experimental CUDA setup is documented in [docs/GPU_SETUP.md](docs/GPU_SETUP.md) (Linux-oriented TF GPU path; not the default desktop install).
+- **Scan progress:** `GET /api/scan-status` includes `eta_seconds` (estimated time remaining). The UI overlay shows phase and file counts; ETA display may lag backend fields.
+
+---
+
 ## Architecture
 
 ```mermaid
@@ -68,7 +104,7 @@ flowchart TB
   subgraph backend["Python FastAPI (main.py)"]
     API["REST /api/*\n127.0.0.1:8000"]
     AI["ai_core.py\nDeepFace · DBSCAN"]
-    DB["database.py\nSQLite organizer.db"]
+    DB["database.py\nSQLite in AppData"]
   end
 
   UI -->|"fetch()"| API
@@ -97,7 +133,7 @@ This section documents how the application was built — useful for onboarding a
 - Designed SQLite schema: `photos` (1) → (N) `faces`, `people`, embeddings as BLOBs, `bounding_box` JSON per face, `cluster_id` / `person_id` linkage.
 - `photos.has_faces` flag distinguishes processed images with no detections (faceless) from pending work.
 - Implemented `DatabaseManager` with validation, migrations-style helpers, gallery/search queries, noise-face queries, exemplar-face summaries for UI crops, and merge semantics.
-- Local DB path: **`organizer.db`** at project root (gitignored).
+- Local DB path: **`%AppData%\com.photo.organizer\organizer.db`** (task 1.2.2). Override with `PHOTO_ORGANIZER_APP_DATA` or `PHOTO_ORGANIZER_DB_PATH` for dev/tests. Legacy `organizer.db` in repo root is migrated on first run if present.
 
 ### Phase 2 — Offline AI core (`ai_core.py`)
 
@@ -157,7 +193,8 @@ This section documents how the application was built — useful for onboarding a
 | Tool | Notes |
 |------|--------|
 | **Python 3.12** | `py -3.12 --version` — required for TensorFlow wheels on Windows |
-| **Node.js 18+** | For Vite and Tauri CLI |
+| **Node.js 20** | Matches CI (`.github/workflows/ci.yml`); for Vite and Tauri CLI |
+| **Windows 10/11 x64** | Primary supported platform for v1.0 |
 | **Rust (rustup)** | For `tauri dev` / `tauri build` |
 | **Microsoft Visual C++ Redistributable** | Often required by TensorFlow native DLLs on Windows |
 
@@ -245,6 +282,19 @@ npm run tauri:dev
 
 ---
 
+## Running tests
+
+From the repository root with venv activated (`.\venv\Scripts\Activate.ps1`):
+
+```powershell
+venv\Scripts\python.exe -m pytest -m "not slow" -q
+npm test
+```
+
+CI (`.github/workflows/ci.yml`) also runs `pytest -m "not slow and not integration_slow"` on Ubuntu and `npm ci` + `npm run build`. See [CONTRIBUTING.md](CONTRIBUTING.md) for branch workflow and job overview.
+
+---
+
 ## HTTP API reference
 
 Base URL: **`http://127.0.0.1:8000`**. The React client is implemented in `src/services/api.ts`.
@@ -253,7 +303,7 @@ Base URL: **`http://127.0.0.1:8000`**. The React client is implemented in `src/s
 |--------|------|---------|
 | `GET` | `/health` | Liveness (`{ "status": "ok" }`) |
 | `POST` | `/api/scan-folder` | Start background folder ingestion |
-| `GET` | `/api/scan-status` | Poll `processed`, `total`, `is_active`, `phase`, `current_file`, `last_error` |
+| `GET` | `/api/scan-status` | Poll `processed`, `total`, `is_active`, `phase`, `current_file` (basename), `last_error`, `eta_seconds`, `cancelled` |
 | `GET` | `/api/gallery` | Gallery list (`person_ids`, `ai_status` = `all` \| `processed` \| `unprocessed` \| `faceless`) |
 | `GET` | `/api/search` | Intersection search by comma-separated names |
 | `GET` | `/api/people` | People summaries with `exemplar_face_id` and `bounding_box` for UI crops |
@@ -269,6 +319,15 @@ Base URL: **`http://127.0.0.1:8000`**. The React client is implemented in `src/s
 | `GET` | `/api/people/{id}/thumbnail` | Person avatar thumbnail |
 | `POST` | `/api/dev/reset-library` | Clear ingestion data (**dev only**, `PHOTO_ORGANIZER_DEV=1`) |
 | `POST` | `/api/dev/simulate-scan` | Scan a test folder (**dev only**) |
+
+**Versioned routes (`/api/v1/*`):** see [docs/API_VERSIONING.md](docs/API_VERSIONING.md).
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/api/v1/health` | Versioned liveness (`api_version: v1`) |
+| `POST` | `/api/v1/log-error` | React Error Boundary reports (204) |
+| `POST` | `/api/v1/scan-cancel` | Request scan cancellation |
+| `GET` | `/api/v1/clusters/health` | Latest DBSCAN quality metrics |
 
 **Naming rule:** There is no `/api/people/name` route. Assigning display names always goes through **`POST /api/clusters/identify`** with `{ cluster_id, name }` or `{ face_id, name | person_id }`.
 
@@ -292,6 +351,9 @@ Packaged binaries matching `photo-ai-backend-*` are **gitignored**; only sources
 | Variable | Used by | Description |
 |----------|---------|-------------|
 | `PYTHONNOUSERSITE=1` | Python | Ignore user site-packages (set in `run_app.bat`) |
+| `PHOTO_ORGANIZER_APP_DATA` | `database.py` | Override AppData root (default `%AppData%\com.photo.organizer` on Windows) |
+| `PHOTO_ORGANIZER_DB_PATH` | `database.py` | Override SQLite file path (dev/tests) |
+| `PHOTO_ORGANIZER_DEV=1` | `main.py` | Enable `/api/dev/*` and OpenAPI `/docs` |
 | `PHOTO_ORGANIZER_EXTERNAL_BACKEND=1` | Tauri | Do not spawn sidecar; use existing server |
 | `PHOTO_ORGANIZER_HOST` | `main.py` / sidecar | Bind host (default `127.0.0.1`) |
 | `PHOTO_ORGANIZER_PORT` | `main.py` / sidecar | Bind port (default `8000`) |
@@ -307,13 +369,12 @@ Packaged binaries matching `photo-ai-backend-*` are **gitignored**; only sources
 The following are **never committed** (see `.gitignore`):
 
 - `venv/`, `node_modules/`, `src-tauri/target/`
-- `organizer.db`, `*.db`, `data/`
+- Local databases under AppData or dev overrides (`*.db`, `organizer.db` in repo root from legacy dev)
 - `.env`, `.env.*`
-- `.thumbnail_cache/`
 - PyInstaller outputs: `dist-sidecar/`, `build-sidecar/`, `src-tauri/binaries/photo-ai-backend-*`
 - Logs and IDE folders
 
-Your photo library paths and face embeddings remain on disk only under your local database file.
+**Runtime data** lives under `%AppData%\com.photo.organizer\` (SQLite, thumbnail LRU cache, rotating logs). Your photo library paths and face embeddings stay on your machine only.
 
 ---
 
@@ -346,7 +407,9 @@ Private project — all rights reserved unless stated otherwise.
 | **Backend** | Python 3.12, FastAPI, SQLite, DeepFace, TensorFlow, scikit-learn |
 | **Aplikacja desktop** | Tauri 2, React 18, TypeScript, Vite, Tailwind CSS |
 | **Domyślne API** | `http://127.0.0.1:8000` (tylko loopback) |
-| **Baza** | `organizer.db` (tworzona lokalnie, nie trafia do Gita) |
+| **Baza i cache** | `%AppData%\com.photo.organizer\` (nie w katalogu repo) |
+
+Szczegóły po angielsku: [Quick start](#quick-start), [Running tests](#running-tests), [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
@@ -407,7 +470,7 @@ Krótki opis faz rozwoju projektu (onboarding):
 
 ### Faza 1 — Warstwa danych (`database.py`)
 
-Schemat SQLite (`photos`, `faces`, `people`), embeddingi jako BLOB, zapytania galerii/wyszukiwania, twarze noise, scalanie osób. Plik **`organizer.db`** jest lokalny i gitignorowany.
+Schemat SQLite (`photos`, `faces`, `people`), embeddingi jako BLOB, zapytania galerii/wyszukiwania, twarze noise, scalanie osób. Baza: **`%AppData%\com.photo.organizer\organizer.db`** (nie w root repo).
 
 ### Faza 2 — Silnik AI (`ai_core.py`)
 
@@ -451,7 +514,8 @@ TensorFlow i DeepFace **nie wspierają Pythona 3.14** na Windows. Standard proje
 | Narzędzie | Uwagi |
 |-----------|--------|
 | **Python 3.12** | `py -3.12 --version` |
-| **Node.js 18+** | Vite, Tauri CLI |
+| **Node.js 20** | Vite, Tauri CLI (zgodnie z CI) |
+| **Windows 10/11 x64** | Platforma docelowa v1.0 |
 | **Rust (rustup)** | `tauri dev` / `tauri build` |
 | **VC++ Redistributable** | Często wymagany przez TensorFlow na Windows |
 
@@ -516,7 +580,7 @@ Bazowy URL: **`http://127.0.0.1:8000`**. Klient: `src/services/api.ts`.
 |--------|---------|------|
 | `GET` | `/health` | Sprawdzenie żywotności |
 | `POST` | `/api/scan-folder` | Start skanu folderu |
-| `GET` | `/api/scan-status` | Postęp skanu |
+| `GET` | `/api/scan-status` | Postęp skanu (`eta_seconds`, fazy, basename `current_file`) |
 | `GET` | `/api/gallery` | Galeria (`person_ids`, `ai_status` + `faceless`) |
 | `GET` | `/api/search` | Wyszukiwanie po imionach (AND) |
 | `GET` | `/api/people` | Lista osób (z bbox exemplar) |
@@ -532,6 +596,8 @@ Bazowy URL: **`http://127.0.0.1:8000`**. Klient: `src/services/api.ts`.
 | `GET` | `/api/people/{id}/thumbnail` | Awatar osoby |
 | `POST` | `/api/dev/reset-library` | Reset danych (**tylko dev**, `PHOTO_ORGANIZER_DEV=1`) |
 | `POST` | `/api/dev/simulate-scan` | Testowy skan (**tylko dev**) |
+
+Trasy `/api/v1/*`: `health`, `log-error`, `scan-cancel`, `clusters/health` — patrz sekcja angielska [HTTP API reference](#http-api-reference).
 
 **Ważne:** Nie ma endpointu `/api/people/name` — nazwy zawsze przez **`POST /api/clusters/identify`**.
 
@@ -562,7 +628,7 @@ Binaria `photo-ai-backend-*` są w `.gitignore`.
 
 ## Dane, prywatność i `.gitignore`
 
-Do repozytorium **nie trafiają**: `venv/`, bazy `*.db`, `organizer.db`, `.env`, `.thumbnail_cache/`, zdjęcia użytkownika, binaria sidecara, `node_modules/`, artefakty build Rust.
+Do repozytorium **nie trafiają**: `venv/`, bazy `*.db`, `.env`, zdjęcia użytkownika, binaria sidecara, `node_modules/`, artefakty build Rust. Dane runtime: **`%AppData%\com.photo.organizer\`**.
 
 Ścieżki do Twoich albumów i embeddingi twarzy pozostają wyłącznie na dysku lokalnym.
 

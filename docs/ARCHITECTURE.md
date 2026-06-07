@@ -17,10 +17,12 @@ graph TB
         end
 
         subgraph Sidecar["Python Sidecar (FastAPI, PyInstaller bundle)"]
-            API["FastAPI<br/>127.0.0.1:8000<br/>• /api/v1/* (versioned)<br/>• /api/dev/* (DEV only)<br/>• Host-header guard<br/>• Pydantic validation"]
+            API["FastAPI<br/>127.0.0.1:8000<br/>• LoopbackHostMiddleware<br/>• SecurityHeadersMiddleware<br/>• /api/* + /api/v1/*<br/>• /api/dev/* (DEV only)<br/>• Pydantic validation"]
             AICore["ai_core.py<br/>• batch detection<br/>• embeddings<br/>• clustering"]
+            ThumbnailEngine["main.py::ThumbnailEngine<br/>• JPEG cache<br/>• LRU 500 MB w AppData"]
             VectorStore["vector_store.py<br/>FAISS IndexFlatIP<br/>[Faza 2]"]
             DBLayer["database.py<br/>• migrations<br/>• CRUD<br/>• connection mgmt"]
+            LogPrivacy["log_privacy.py<br/>hash_path_for_log()"]
         end
 
         subgraph Models["AI Models (bundled)"]
@@ -45,6 +47,8 @@ graph TB
 
     API --> AICore
     API --> DBLayer
+    API --> ThumbnailEngine
+    ThumbnailEngine --> Thumbs
     AICore --> DeepFace
     DeepFace --> ArcFace
     AICore --> VectorStore
@@ -53,15 +57,15 @@ graph TB
 
     DBLayer --> SQLite
     VectorStore --> FAISSFile
-    API --> Thumbs
     Sidecar --> Logs
+    API -.-> LogPrivacy
 
     classDef rust fill:#dea584,stroke:#8b4513,color:#000
     classDef python fill:#3776ab,stroke:#1d4e6f,color:#fff
     classDef storage fill:#f9d71c,stroke:#b8860b,color:#000
     classDef model fill:#a370ff,stroke:#5319e7,color:#fff
     class RustCore,WebView rust
-    class API,AICore,VectorStore,DBLayer python
+    class API,AICore,VectorStore,DBLayer,ThumbnailEngine,LogPrivacy python
     class SQLite,FAISSFile,Thumbs,Logs storage
     class DeepFace,ArcFace model
 ```
@@ -86,10 +90,10 @@ sequenceDiagram
     User->>UI: Click "Scan folder"
     UI->>Rust: open directory dialog
     Rust-->>UI: selected path
-    UI->>API: POST /api/v1/scan-start {path}
+    UI->>API: POST /api/scan-folder {folder_path}
     API->>API: validate_scan_path() (traversal guard)
-    API->>AI: scan_directory(path) [async task]
-    API-->>UI: 202 Accepted {scan_id}
+    API->>AI: _execute_folder_scan_async() [async task]
+    API-->>UI: 200 {status: started, total_files}
 
     Note over AI,DB: Faza 1: scanning
     loop Każdy batch (32 obrazów)
@@ -112,8 +116,8 @@ sequenceDiagram
     AI-->>API: state.phase = 'idle'
 
     loop UI polling co 500ms
-        UI->>API: GET /api/v1/progress
-        API-->>UI: {phase, current, total, eta_seconds}
+        UI->>API: GET /api/scan-status
+        API-->>UI: {phase, processed, total, is_active, eta_seconds, ...}
     end
 
     User->>UI: (opcjonalnie) Click "Stop"
@@ -264,9 +268,9 @@ stateDiagram-v2
     LoadingModels --> Ready: /health → model_loaded=true
     note right of LoadingModels: UI pokazuje Splash (task 4.1.5)
 
-    Ready --> Scanning: POST /scan-start
+    Ready --> Scanning: POST /api/scan-folder
     Scanning --> Ready: scan complete
-    Scanning --> Cancelled: POST /scan-cancel
+    Scanning --> Cancelled: POST /api/v1/scan-cancel
     Cancelled --> Ready: finalize partial
     Scanning --> Error: AICoreError
     Error --> Ready: state.last_error set, no crash
@@ -294,9 +298,14 @@ graph LR
         Validate["validate_scan_path()<br/>• reject ..<br/>• reject symlinks out-of-tree<br/>• reject device files<br/>• reject reserved names"]
     end
 
-    subgraph Boundary2["🔒 Loopback + Host guard (task 1.2.5, 3.1.2)"]
-        Loopback["bind 127.0.0.1 only"]
-        HostGuard["Host header check<br/>(DNS rebinding mitigation)"]
+    subgraph Boundary2["🔒 Loopback + HTTP hardening (task 1.2.5, 3.1.2, 3.1.3)"]
+        Loopback["assert_loopback_bind_host()<br/>bind 127.0.0.1 only"]
+        HostGuard["LoopbackHostMiddleware<br/>Host header allowlist<br/>(DNS rebinding mitigation)"]
+        SecHeaders["SecurityHeadersMiddleware<br/>X-Content-Type-Options,<br/>X-Frame-Options, Referrer-Policy"]
+    end
+
+    subgraph Boundary3["🔒 Log privacy (GAP-003 remediated)"]
+        LogHash["log_privacy.py<br/>hash_path_for_log()<br/>basename in scan status"]
     end
 
     subgraph Trusted["✅ Trusted zone (sidecar)"]
@@ -306,17 +315,18 @@ graph LR
     Photos --> Boundary1
     Paths --> Boundary1
     Boundary1 --> Boundary2
-    Boundary2 --> Trusted
+    Boundary2 --> Boundary3
+    Boundary3 --> Trusted
 
     classDef untrusted fill:#f8d7da,stroke:#b60205,color:#000
     classDef boundary fill:#fff3cd,stroke:#b8860b,color:#000
     classDef trusted fill:#d4edda,stroke:#0e8a16,color:#000
     class Photos,Paths untrusted
-    class Validate,Loopback,HostGuard boundary
+    class Validate,Loopback,HostGuard,SecHeaders,LogHash boundary
     class Processing trusted
 ```
 
-**Defense-in-depth:** (1) Tauri file dialog jako jedyne źródło ścieżki (frontend nie wysyła arbitralnych stringów), (2) backend `validate_scan_path()` mimo to waliduje, (3) bind loopback-only, (4) Host header guard przeciw DNS rebinding, (5) `/api/dev/*` i `/docs` wyłączone w release.
+**Defense-in-depth:** (1) Tauri file dialog jako jedyne źródło ścieżki (frontend nie wysyła arbitralnych stringów), (2) backend `validate_scan_path()` mimo to waliduje, (3) bind loopback-only, (4) `LoopbackHostMiddleware` przeciw DNS rebinding (task **3.1.2**), (5) `SecurityHeadersMiddleware` na odpowiedziach HTTP sidecara + CSP w `tauri.conf.json` (task **3.1.3**), (6) `log_privacy.py` — hashe ścieżek w logach, basename w `GET /api/scan-status`, (7) `/api/dev/*` i `/docs` wyłączone w release.
 
 ---
 
@@ -367,4 +377,4 @@ graph LR
 ---
 
 *Diagramy w Mermaid renderują się natywnie na GitHub. Do edycji: [mermaid.live](https://mermaid.live).*
-*Ostatnia aktualizacja: po Fazie 2. Powiązane zadania: 1.2.x, 1.3.x, 2.2.x, 3.1.x, 3.2.5, 4.1.x.*
+*Ostatnia aktualizacja: 2026-05-27 (task 3.3.x — middleware, scan API, ThumbnailEngine, log_privacy). Powiązane zadania: 1.2.x, 1.3.x, 2.2.x, 3.1.x, 3.2.5, 4.1.x.*
