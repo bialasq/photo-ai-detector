@@ -1051,6 +1051,21 @@ def _is_blocked_scan_directory(directory: Path) -> bool:
     return False
 
 
+def _is_within_scan_root(resolved: Path, scan_root: Path) -> bool:
+    """Return True when `resolved` equals `scan_root` or lies under it."""
+    if os.name == "nt":
+        resolved_cmp = Path(os.path.normcase(str(resolved)))
+        root_cmp = Path(os.path.normcase(str(scan_root)))
+        try:
+            return resolved_cmp == root_cmp or resolved_cmp.is_relative_to(root_cmp)
+        except ValueError:
+            return False
+    try:
+        return resolved == scan_root or resolved.is_relative_to(scan_root)
+    except ValueError:
+        return False
+
+
 def resolve_and_validate_folder(
     folder_path: str,
     *,
@@ -1191,20 +1206,38 @@ def discover_image_files_recursively(folder: Path) -> list[Path]:
     Raises:
         ValueError: When the discovered file count exceeds the configured limit.
     """
+    scan_root = folder.resolve()
     discovered: list[Path] = []
     max_files = _max_scan_files()
 
-    for dirpath, dirnames, filenames in os.walk(folder, topdown=True):
+    for dirpath, dirnames, filenames in os.walk(
+        scan_root, topdown=True, followlinks=False
+    ):
         current_dir = Path(dirpath)
-        dirnames[:] = [
-            name
-            for name in dirnames
-            if not _is_blocked_scan_directory(current_dir / name)
-        ]
+        allowed_dirnames: list[str] = []
+        for name in dirnames:
+            child = current_dir / name
+            if _is_blocked_scan_directory(child):
+                continue
+            if not _is_within_scan_root(child.resolve(), scan_root):
+                continue
+            allowed_dirnames.append(name)
+        dirnames[:] = allowed_dirnames
 
         for filename in filenames:
             candidate = (current_dir / filename).resolve()
             if candidate.suffix.lower() not in SCAN_IMAGE_SUFFIXES:
+                continue
+            if not _is_within_scan_root(candidate, scan_root):
+                LOGGER.warning(
+                    "Skipping image file outside scan root",
+                    extra={
+                        "ctx": {
+                            "event": "scan.file.outside_root",
+                            "path_hash": hash_path_for_log(candidate),
+                        }
+                    },
+                )
                 continue
             discovered.append(candidate)
             if len(discovered) > max_files:
