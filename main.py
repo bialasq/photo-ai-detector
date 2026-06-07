@@ -2053,6 +2053,17 @@ class LoopbackHostMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Add baseline security headers to every HTTP response (including FileResponse)."""
+
+    async def dispatch(self, request: Request, call_next):  # type: ignore[no-untyped-def]
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
+
+
 def assert_loopback_bind_host(host: str) -> str:
     """
     Validate that the sidecar binds only to a loopback interface.
@@ -2099,6 +2110,7 @@ def create_application(*, dev_mode: bool | None = None) -> FastAPI:
     )
     # Outermost middleware (added last): reject invalid Host before CORS or route handlers.
     application.add_middleware(LoopbackHostMiddleware)
+    application.add_middleware(SecurityHeadersMiddleware)
 
     register_exception_handlers(application)
 

@@ -211,7 +211,7 @@
 | V14.1 | No secrets in source control | ✅ | `.gitignore` — `.env`, credentials patterns; repo uses env vars for overrides (`PHOTO_ORGANIZER_*`) | |
 | V14.2 | Debug features off in release | ✅ | Dev routes + stderr logging only when `PHOTO_ORGANIZER_DEV=1` (`logging_config.py::setup_logging` L130–133) | Release sidecar: file logging only at INFO |
 | V14.3 | Secure defaults | ✅ | `DEFAULT_HOST = "127.0.0.1"` (L119); DB defaults to AppData not CWD (`database.py::get_db_path` L162) | Hard fail if `APPDATA` missing without override (L78–81) |
-| V14.4 | Dependency audit in build pipeline | ⚠️ **GAP** | CI lint job skips automated audit | **Task 3.1.5** |
+| V14.4 | Dependency audit in build pipeline | ✅ | `.github/workflows/ci.yml` — `security-audit` job (`pip-audit` + `npm audit`, warning-only) | **Task 3.1.5** — see GAP-005 |
 
 ---
 
@@ -219,7 +219,7 @@
 
 | Chapter | Status | Reason |
 |---------|--------|--------|
-| V15 — Security headers (CSP, X-Content-Type-Options) | ⚠️ **GAP** (P3) | Tauri WebView + Vite frontend; backend does not set CSP headers. **Task 3.1.3** |
+| V15 — Security headers (CSP, X-Content-Type-Options) | ✅ | **Backend:** `main.py::SecurityHeadersMiddleware` — `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy` on all responses (`tests/integration/test_security_headers.py`). **WebView:** `src-tauri/tauri.conf.json` — enforcing CSP (task 3.1.3). CSP is **not** sent on API JSON/JPEG responses (WebView policy only). | Manual DevTools verification required — Tauri has no `Content-Security-Policy-Report-Only` config field |
 | V16 — WebRTC / SMS / email | **N/A** | Not used |
 | V17 — Internet of things | **N/A** | Desktop app |
 
@@ -253,7 +253,7 @@
 | **P1** | GAP-003 | **PII path leakage (logs + API):** plaintext filesystem paths at INFO and in scan status, inconsistent with `hash_path_for_log`. | `main.py::ThumbnailEngine.get_or_create_thumbnail` (L960–963); `ScanProgressState.set_current_file` (L492–494, L1563); `GET /api/scan-status` returns `current_file` (L2008); doc mismatch L220–222 | **New task (proposed):** `3.1.x-logging-api-path-privacy` — use `hash_path_for_log` / basename in logs; align `current_file` with doc or hash; audit other INFO logs |
 | **P2** | GAP-004 | **`last_error` in scan-status** may surface raw exception strings from ingestion/clustering to the WebView. | `ScanProgressState.last_error` (L224–227); `finish_scan(error_message=str(exc))` (L1688, L1762) | **New task (proposed):** sanitize user-facing scan errors (stable codes + safe message) |
 | **P2** | GAP-005 | **Dependency vulnerability scanning** in CI (`security-audit` job: `pip-audit` + `npm audit`, warning-only). | `.github/workflows/ci.yml` — `continue-on-error: true`; does **not** fail PR | **[3.1.5](../tasks/phase-3/3.1.5-pip-audit-npm-audit-w-ci-warning-only.md)** — **Remediated (warning-only)**. **Note:** `pip-audit -r` audits **declared** requirement ranges, not the installed production venv; resolved versions may differ from a real `pip install` (conscious speed vs. precision trade-off while scans remain non-blocking). |
-| **P3** | GAP-006 | **Security headers / CSP** for Tauri WebView not defined on backend or frontend build. | No CSP middleware in `main.py`; frontend Vite config | **[3.1.3](../tasks/phase-3/3.1.3-security-headers-csp-w-tauri-webview-x-content-type-options.md)** |
+| **P3** | GAP-006 | **Security headers / CSP** for Tauri WebView + sidecar HTTP responses. | `main.py::SecurityHeadersMiddleware`; `src-tauri/tauri.conf.json` | **[3.1.3](../tasks/phase-3/3.1.3-security-headers-csp-w-tauri-webview-x-content-type-options.md)** — **Remediated.** **CSP notes:** (1) Tauri exposes only enforcing `csp` (no native report-only) — validate in WebView DevTools after changes. (2) `img-src` **must** include `http://127.0.0.1:8000` / `http://localhost:8000` — gallery loads thumbnails/full JPEG from sidecar `<img src>`, not `connect-src`. (3) `style-src 'unsafe-inline'` — required for React `style={{…}}` and `react-window` cell layout. (4) `script-src 'unsafe-eval'` — kept for `tauri dev` + Vite HMR; production Vite bundle uses external `.js` only (candidate to drop in follow-up after manual verification). |
 
 ### Conscious decisions (not GAPs)
 
