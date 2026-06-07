@@ -19,7 +19,7 @@ from ai_core import (
     ingest_image_to_database,
 )
 from database import DatabaseManager
-from main import ScanProgressState, _run_clustering_sync
+from main import ScanProgressState, _run_clustering_sync, format_user_scan_last_error
 
 
 def test_aicore_error_is_exception() -> None:
@@ -212,11 +212,13 @@ def test_dbscan_failure_sets_last_error_no_crash(
 
     try:
         _run_clustering_sync(services)
-    except ClusteringError as exc:
-        scan_state.last_error = f"Clustering failed: {exc}"
+    except ClusteringError:
+        scan_state.last_error = format_user_scan_last_error(scenario="clustering")
 
     assert scan_state.last_error is not None
-    assert "Clustering failed" in scan_state.last_error
+    assert scan_state.last_error == "Clustering failed"
+    assert "oom" not in scan_state.last_error.lower()
+    assert "dbscan" not in scan_state.last_error.lower()
 
 
 def test_broken_jpg_does_not_break_batch(

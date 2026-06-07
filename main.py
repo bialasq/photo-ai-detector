@@ -40,7 +40,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Final, Optional
+from typing import Any, Final, Literal, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request, status
@@ -227,7 +227,10 @@ class ScanStatusResponse(BaseModel):
     )
     last_error: Optional[str] = Field(
         default=None,
-        description="Most recent per-file or clustering error message, if any.",
+        description=(
+            "Safe user-facing summary of the most recent scan issue; "
+            "never contains raw exception text or filesystem paths."
+        ),
     )
     cancelled: bool = Field(
         default=False,
@@ -365,6 +368,32 @@ class PersonSummaryItem(BaseModel):
 # Thread-safe scan progress state
 # ---------------------------------------------------------------------------
 
+_SCAN_USER_ERROR_MESSAGES: Final[dict[str, str]] = {
+    "ingest_file": "Failed to process file",
+    "ingest_batch": "Failed to process batch",
+    "clustering": "Clustering failed",
+    "scan_abort": "Scan failed",
+    "cancelled": "Scan cancelled",
+}
+
+
+def format_user_scan_last_error(
+    *,
+    file_basename: str | None = None,
+    scenario: Literal[
+        "ingest_file",
+        "ingest_batch",
+        "clustering",
+        "scan_abort",
+        "cancelled",
+    ],
+) -> str:
+    """Return a safe scan-status message for the WebView (English UI; no raw exceptions)."""
+    message = _SCAN_USER_ERROR_MESSAGES[scenario]
+    if scenario == "ingest_file" and file_basename:
+        return f"{file_basename}: {message}"
+    return message
+
 
 @dataclass
 class ScanProgressState:
@@ -439,7 +468,9 @@ class ScanProgressState:
                 "is_active": self.is_active,
                 "phase": self.phase,
                 "cancelled": self.cancelled,
-                "current_file": self.current_file,
+                "current_file": (
+                    Path(self.current_file).name if self.current_file else None
+                ),
                 "last_error": self.last_error,
                 "eta_seconds": eta_seconds,
             }
@@ -534,8 +565,13 @@ def _thumbnail_cache_max_bytes() -> int:
 def _remove_legacy_thumbnail_cache_dir() -> None:
     if LEGACY_THUMBNAIL_CACHE_DIR.is_dir():
         LOGGER.info(
-            "Removing legacy project-root thumbnail cache: %s",
-            LEGACY_THUMBNAIL_CACHE_DIR,
+            "Removing legacy project-root thumbnail cache",
+            extra={
+                "ctx": {
+                    "event": "thumbnail.cache.legacy_remove",
+                    "path_hash": hash_path_for_log(LEGACY_THUMBNAIL_CACHE_DIR),
+                }
+            },
         )
         shutil.rmtree(LEGACY_THUMBNAIL_CACHE_DIR, ignore_errors=True)
 
@@ -562,10 +598,15 @@ class ThumbnailEngine:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._load_or_rebuild_index()
         LOGGER.info(
-            "ThumbnailEngine cache directory: %s (max_bytes=%s entries=%s)",
-            self.cache_dir,
-            self._max_bytes,
-            len(self._access_index),
+            "ThumbnailEngine cache directory ready",
+            extra={
+                "ctx": {
+                    "event": "thumbnail.cache.init",
+                    "path_hash": hash_path_for_log(self.cache_dir),
+                    "max_bytes": self._max_bytes,
+                    "entries": len(self._access_index),
+                }
+            },
         )
 
     def _load_or_rebuild_index(self) -> None:
@@ -853,10 +894,15 @@ class ThumbnailEngine:
                 optimize=True,
             )
             LOGGER.debug(
-                "Face thumbnail generated source=%s cache=%s bbox=%s",
-                source_path,
-                cache_path,
-                bounding_box,
+                "Face thumbnail generated",
+                extra={
+                    "ctx": {
+                        "event": "thumbnail.face.generated",
+                        "source_hash": hash_path_for_log(source_path),
+                        "cache_name": cache_path.name,
+                        "bbox": bounding_box,
+                    }
+                },
             )
         finally:
             image.close()
@@ -921,11 +967,16 @@ class ThumbnailEngine:
                 optimize=True,
             )
             LOGGER.debug(
-                "Thumbnail generated source=%s cache=%s size=%sx%s",
-                source_path,
-                cache_path,
-                resized.width,
-                resized.height,
+                "Thumbnail generated",
+                extra={
+                    "ctx": {
+                        "event": "thumbnail.generated",
+                        "source_hash": hash_path_for_log(source_path),
+                        "cache_name": cache_path.name,
+                        "width": resized.width,
+                        "height": resized.height,
+                    }
+                },
             )
         finally:
             image.close()
@@ -962,9 +1013,14 @@ class ThumbnailEngine:
                 return cache_path
 
             LOGGER.info(
-                "Thumbnail cache miss — generating %s (source=%s)",
-                cache_path.name,
-                source_path,
+                "Thumbnail cache miss — generating",
+                extra={
+                    "ctx": {
+                        "event": "thumbnail.miss",
+                        "source_hash": hash_path_for_log(source_path),
+                        "cache_name": cache_path.name,
+                    }
+                },
             )
             self._generate_thumbnail_file(
                 source_path=source_path,
@@ -1657,7 +1713,10 @@ async def _execute_folder_scan_async(
                     type(exc).__name__,
                     exc,
                 )
-                scan_state.last_error = f"{image_path.name}: {exc}"
+                scan_state.last_error = format_user_scan_last_error(
+                    file_basename=image_path.name,
+                    scenario="ingest_file",
+                )
             finally:
                 scan_state.increment_processed(len(batch_paths))
                 scan_state.increment_actually_processed(len(batch_paths))
@@ -1672,7 +1731,9 @@ async def _execute_folder_scan_async(
                 )
             except Exception as exc:  # noqa: BLE001
                 LOGGER.exception("Failed to ingest final batch: %s", exc)
-                scan_state.last_error = str(exc)
+                scan_state.last_error = format_user_scan_last_error(
+                    scenario="ingest_batch",
+                )
             finally:
                 scan_state.increment_processed(len(pending_batch))
                 scan_state.increment_actually_processed(len(pending_batch))
@@ -1706,7 +1767,9 @@ async def _execute_folder_scan_async(
             await asyncio.to_thread(_run_clustering_sync, services)
         except Exception as exc:  # noqa: BLE001
             LOGGER.exception("Incremental clustering failed: %s", exc)
-            scan_state.last_error = f"Clustering failed: {exc}"
+            scan_state.last_error = format_user_scan_last_error(
+                scenario="clustering",
+            )
 
         snapshot = scan_state.snapshot()
         LOGGER.info(
@@ -1722,7 +1785,9 @@ async def _execute_folder_scan_async(
 
     except Exception as exc:  # noqa: BLE001 — catastrophic scan failure
         LOGGER.exception("Background scan aborted: %s", exc)
-        scan_state.finish_scan(error_message=str(exc))
+        scan_state.finish_scan(
+            error_message=format_user_scan_last_error(scenario="scan_abort")
+        )
         return
 
     scan_state.finish_scan()
@@ -1793,10 +1858,14 @@ async def start_folder_scan(
                 task.result()
             except asyncio.CancelledError:
                 LOGGER.warning("Folder scan task was cancelled")
-                services.scan_state.finish_scan(error_message="Scan cancelled")
+                services.scan_state.finish_scan(
+                    error_message=format_user_scan_last_error(scenario="cancelled")
+                )
             except Exception as exc:  # noqa: BLE001
                 LOGGER.exception("Folder scan task crashed: %s", exc)
-                services.scan_state.finish_scan(error_message=str(exc))
+                services.scan_state.finish_scan(
+                    error_message=format_user_scan_last_error(scenario="scan_abort")
+                )
 
         services.scan_task.add_done_callback(_on_task_done)
 
