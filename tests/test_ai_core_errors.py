@@ -140,6 +140,36 @@ def test_memory_error_raises_aicore_error(jpeg_file_factory) -> None:
     assert "memory.jpg" in error.context["path"]
 
 
+def test_value_error_from_represent_returns_empty_and_records_path(
+    jpeg_file_factory,
+) -> None:
+    """``DeepFace.represent`` ValueError → ``EmbeddingError`` (lines 935-945) → ``[]``."""
+    image_path = jpeg_file_factory("bad-tensor.jpg")
+    engine = AICoreEngine()
+    mock_deepface = MagicMock()
+    mock_deepface.represent.side_effect = ValueError("invalid image tensor")
+
+    with patch.object(engine, "_probe_detector_backend", return_value="opencv"):
+        with patch.object(engine, "_get_deepface", return_value=mock_deepface):
+            with patch("ai_core._load_image_bgr", return_value=np.zeros((64, 64, 3), dtype=np.uint8)):
+                assert engine.process_image(image_path) == []
+
+
+def test_unexpected_represent_exception_returns_empty_list(
+    jpeg_file_factory,
+) -> None:
+    """Non-domain DeepFace failures are logged and return ``[]`` (lines 971-978)."""
+    image_path = jpeg_file_factory("tf-crash.jpg")
+    engine = AICoreEngine()
+    mock_deepface = MagicMock()
+    mock_deepface.represent.side_effect = RuntimeError("tensorflow internal error")
+
+    with patch.object(engine, "_probe_detector_backend", return_value="opencv"):
+        with patch.object(engine, "_get_deepface", return_value=mock_deepface):
+            with patch("ai_core._load_image_bgr", return_value=np.zeros((64, 64, 3), dtype=np.uint8)):
+                assert engine.process_image(image_path) == []
+
+
 def test_missing_file_raises_face_detection_error(tmp_path: Path) -> None:
     """Non-existent path fails validation before DeepFace runs."""
     engine = AICoreEngine()

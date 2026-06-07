@@ -1,0 +1,11 @@
+[tool.coverage.run]
+source = ["database", "main", "ai_core"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]
+show_missing = true
