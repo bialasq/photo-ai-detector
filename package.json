@@ -13,7 +13,9 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "npm run sidecar:package && powershell -ExecutionPolicy Bypass -File ./scripts/validate-installer-prereqs.ps1 && tauri build",
-    "sidecar:package": "powershell -ExecutionPolicy Bypass -File ./scripts/package-sidecar.ps1"
+    "sidecar:package": "powershell -ExecutionPolicy Bypass -File ./scripts/package-sidecar.ps1",
+    "sidecar:prefetch": "powershell -ExecutionPolicy Bypass -File ./scripts/prefetch-deepface-weights.ps1",
+    "sidecar:verify": "powershell -ExecutionPolicy Bypass -File ./scripts/verify-sidecar-bundle.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.2.0",

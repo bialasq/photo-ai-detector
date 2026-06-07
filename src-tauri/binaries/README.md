@@ -30,8 +30,12 @@ rustc --print host-tuple
 From the repo root:
 
 ```bash
+powershell -ExecutionPolicy Bypass -File ./scripts/prefetch-deepface-weights.ps1
 npm run sidecar:package
+powershell -ExecutionPolicy Bypass -File ./scripts/verify-sidecar-bundle.ps1
 ```
+
+`sidecar:package` runs prefetch automatically (copies `~/.deepface/weights` when present, else downloads once). Bundled weights: `arcface_weights.h5` + `retinaface.h5`. Offline verification: `verify-sidecar-bundle.ps1`.
 
 Output is copied to `photo-ai-backend-<triple>.exe` in this folder.
 

@@ -48,8 +48,13 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # --- Ensure PyInstaller is installed in the venv ---------------------------------
+$previousErrorAction = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
 & $python -m pip show pyinstaller 2>$null | Out-Null
-if ($LASTEXITCODE -ne 0) {
+$needsPyInstaller = $LASTEXITCODE -ne 0
+$ErrorActionPreference = $previousErrorAction
+
+if ($needsPyInstaller) {
     Write-Host "Installing PyInstaller into venv..."
     & $python -m pip install --no-cache-dir --no-user pyinstaller
     if ($LASTEXITCODE -ne 0) {
@@ -60,6 +65,28 @@ if ($LASTEXITCODE -ne 0) {
 $triple = Get-TargetTriple
 $distDir = Join-Path $ProjectRoot "dist-sidecar"
 $buildDir = Join-Path $ProjectRoot "build-sidecar"
+
+Write-Host "=== Prefetch DeepFace weights for PyInstaller bundle ==="
+& (Join-Path $PSScriptRoot "prefetch-deepface-weights.ps1")
+if ($LASTEXITCODE -ne 0) {
+    throw "DeepFace weight prefetch failed with exit code $LASTEXITCODE"
+}
+
+$vendorDeepface = Join-Path $ProjectRoot "vendor\deepface-weights\.deepface"
+$requiredWeights = @("arcface_weights.h5", "retinaface.h5")
+$vendorWeightsDir = Join-Path $vendorDeepface "weights"
+$migrationsDir = Join-Path $ProjectRoot "migrations"
+
+foreach ($weightName in $requiredWeights) {
+    $weightPath = Join-Path $vendorWeightsDir $weightName
+    if (-not (Test-Path -LiteralPath $weightPath)) {
+        throw "Missing required DeepFace weight before PyInstaller build: $weightPath"
+    }
+}
+
+if (-not (Test-Path -LiteralPath $migrationsDir)) {
+    throw "Missing SQL migrations directory before PyInstaller build: $migrationsDir"
+}
 
 Write-Host "Building PyInstaller sidecar for triple: $triple"
 Write-Host "PYTHONNOUSERSITE=$env:PYTHONNOUSERSITE"
@@ -73,6 +100,9 @@ if (-not (Test-Path -LiteralPath $sitePackages)) {
     throw "venv site-packages not found: $sitePackages"
 }
 
+$addDataDeepface = "$vendorDeepface;.deepface"
+$addDataMigrations = "$migrationsDir;migrations"
+
 & $python -m PyInstaller `
     --noconfirm `
     --clean `
@@ -82,9 +112,12 @@ if (-not (Test-Path -LiteralPath $sitePackages)) {
     --workpath $buildDir `
     --specpath $ProjectRoot `
     --paths $sitePackages `
+    --add-data $addDataDeepface `
+    --add-data $addDataMigrations `
     --collect-all tensorflow `
     --collect-all keras `
     --collect-all ml_dtypes `
+    --collect-all faiss `
     --collect-submodules deepface `
     --collect-submodules retina_face `
     --collect-all cv2 `
@@ -102,11 +135,14 @@ if (-not (Test-Path -LiteralPath $sitePackages)) {
     --copy-metadata pydantic `
     --copy-metadata pydantic_core `
     --copy-metadata pillow `
+    --copy-metadata faiss-cpu `
     --hidden-import tensorflow `
     --hidden-import tensorflow.python `
     --hidden-import keras `
     --hidden-import deepface `
     --hidden-import retina_face `
+    --hidden-import faiss `
+    --hidden-import faiss.swigfaiss `
     --hidden-import cv2 `
     --hidden-import sklearn `
     --hidden-import sklearn.cluster `
@@ -119,6 +155,8 @@ if (-not (Test-Path -LiteralPath $sitePackages)) {
     --hidden-import PIL.Image `
     --hidden-import numpy `
     --hidden-import mtcnn `
+    --hidden-import keras_legacy_env `
+    --hidden-import vector_store `
     --hidden-import uvicorn.logging `
     --hidden-import uvicorn.loops `
     --hidden-import uvicorn.loops.auto `

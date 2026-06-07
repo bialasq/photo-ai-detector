@@ -37,6 +37,7 @@ src-tauri/binaries/photo-ai-backend-*
 dist-sidecar/
 build-sidecar/
 photo-ai-backend.spec
+vendor/deepface-weights/
 
 # IDE / OS
 .idea/
