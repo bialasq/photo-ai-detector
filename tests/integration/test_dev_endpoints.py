@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
+from tests.conftest import stub_fastapi_test_startup
 
 
 @pytest.fixture
@@ -16,16 +17,13 @@ def isolated_db_path(tmp_path, monkeypatch: pytest.MonkeyPatch) -> str:
     """Point lifespan startup at a throwaway SQLite file."""
     db_path = str(tmp_path / "test_organizer.db")
     monkeypatch.setenv("PHOTO_ORGANIZER_DB_PATH", db_path)
+    stub_fastapi_test_startup(monkeypatch)
     return db_path
 
 
 @pytest.fixture
-def fast_client(
-    isolated_db_path: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> Iterator[Any]:
+def fast_client(isolated_db_path: str) -> Iterator[Any]:
     """Build a TestClient without loading TensorFlow / DeepFace at startup."""
-    monkeypatch.setattr(main, "verify_ai_runtime_dependencies", lambda: None)
     yield
 
 

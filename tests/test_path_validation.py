@@ -93,17 +93,3 @@ def test_api_rejects_traversal_path(api_client) -> None:
     body = response.json()
     assert "path_hash" in (body.get("details") or {})
     assert "Windows" not in body["error"]
-
-
-@pytest.fixture
-def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """TestClient with isolated DB (shared with integration tests)."""
-    import main
-
-    monkeypatch.setenv("PHOTO_ORGANIZER_DB_PATH", str(tmp_path / "test.db"))
-    monkeypatch.setattr(main, "verify_ai_runtime_dependencies", lambda: None)
-    application = main.create_application(dev_mode=False)
-    from fastapi.testclient import TestClient
-
-    with TestClient(application) as client:
-        yield client

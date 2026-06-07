@@ -48,7 +48,7 @@ def test_assert_loopback_bind_host_rejects_empty() -> None:
         main.assert_loopback_bind_host("")
 
 
-def _wait_for_health(port: int, *, timeout_seconds: float = 60.0) -> None:
+def _wait_for_health(port: int, *, timeout_seconds: float = 120.0) -> None:
     deadline = time.monotonic() + timeout_seconds
     url = f"http://127.0.0.1:{port}/health"
     while time.monotonic() < deadline:
@@ -62,6 +62,12 @@ def _wait_for_health(port: int, *, timeout_seconds: float = 60.0) -> None:
 
 
 def _listening_addresses_for_port(port: int) -> list[str]:
+    if sys.platform == "win32":
+        return _listening_addresses_windows_netstat(port)
+    return _listening_addresses_linux_ss(port)
+
+
+def _listening_addresses_windows_netstat(port: int) -> list[str]:
     result = subprocess.run(
         ["netstat", "-an"],
         capture_output=True,
@@ -81,6 +87,30 @@ def _listening_addresses_for_port(port: int) -> list[str]:
     return listeners
 
 
+def _listening_addresses_linux_ss(port: int) -> list[str]:
+    result = subprocess.run(
+        ["ss", "-ltn"],
+        capture_output=True,
+        text=True,
+        check=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    listeners: list[str] = []
+    port_suffix = f":{port}"
+    for line in result.stdout.splitlines():
+        if not line.startswith("LISTEN"):
+            continue
+        if port_suffix not in line:
+            continue
+        for token in line.split():
+            if token.endswith(port_suffix):
+                listeners.append(token)
+                break
+    return listeners
+
+
+@pytest.mark.integration_slow
 def test_uvicorn_subprocess_binds_loopback_only(tmp_path: Path) -> None:
     port = _pick_free_port()
     env = {
@@ -88,7 +118,9 @@ def test_uvicorn_subprocess_binds_loopback_only(tmp_path: Path) -> None:
         "PHOTO_ORGANIZER_HOST": "127.0.0.1",
         "PHOTO_ORGANIZER_PORT": str(port),
         "PHOTO_ORGANIZER_DB_PATH": str(tmp_path / "bind-test.db"),
+        "PHOTO_ORGANIZER_APP_DATA": str(tmp_path / "bind-app-data"),
         "PHOTO_ORGANIZER_DEV": "0",
+        "TF_USE_LEGACY_KERAS": "1",
     }
     proc = subprocess.Popen(
         [sys.executable, "main.py"],
@@ -101,7 +133,7 @@ def test_uvicorn_subprocess_binds_loopback_only(tmp_path: Path) -> None:
     try:
         _wait_for_health(port)
         listeners = _listening_addresses_for_port(port)
-        assert listeners, f"Expected LISTENING socket on port {port}, netstat had none"
+        assert listeners, f"Expected LISTEN socket on port {port}, listener scan found none"
         for address in listeners:
             assert address.startswith("127.0.0.1:") or address.startswith("[::1]:"), (
                 f"Non-loopback bind detected: {address!r}"

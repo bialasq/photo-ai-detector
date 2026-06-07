@@ -6,13 +6,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
+from tests.conftest import stub_fastapi_test_startup
 
 
 @pytest.fixture
 def api_client_factory(tmp_path, monkeypatch: pytest.MonkeyPatch):
     """Build TestClient instances with isolated DB and without TensorFlow startup."""
     monkeypatch.setenv("PHOTO_ORGANIZER_DB_PATH", str(tmp_path / "test.db"))
-    monkeypatch.setattr(main, "verify_ai_runtime_dependencies", lambda: None)
+    stub_fastapi_test_startup(monkeypatch)
 
     def _factory(*, dev_mode: bool | None) -> TestClient:
         application = main.create_application(dev_mode=dev_mode)

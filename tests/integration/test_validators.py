@@ -5,17 +5,6 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-import main
-
-
-@pytest.fixture
-def api_client(tmp_path, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("PHOTO_ORGANIZER_DB_PATH", str(tmp_path / "validators.db"))
-    monkeypatch.setattr(main, "verify_ai_runtime_dependencies", lambda: None)
-    application = main.create_application(dev_mode=False)
-    with TestClient(application) as client:
-        yield client
-
 
 def test_scan_folder_empty_path_returns_422(api_client: TestClient) -> None:
     response = api_client.post("/api/scan-folder", json={"folder_path": "   "})

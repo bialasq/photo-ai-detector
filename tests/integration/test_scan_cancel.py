@@ -13,15 +13,6 @@ import main
 from ai_core import DEFAULT_DETECTION_BATCH_SIZE
 
 
-@pytest.fixture
-def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("PHOTO_ORGANIZER_DB_PATH", str(tmp_path / "test.db"))
-    monkeypatch.setattr(main, "verify_ai_runtime_dependencies", lambda: None)
-    application = main.create_application(dev_mode=False)
-    with TestClient(application) as client:
-        yield client
-
-
 def _populate_photo_folder(folder: Path, count: int) -> None:
     folder.mkdir(parents=True, exist_ok=True)
     for index in range(count):
