@@ -17,11 +17,12 @@ jobs:
   python-tests:
     name: Python tests
     runs-on: ubuntu-latest
-    env:
-      PHOTO_ORGANIZER_APP_DATA: ${{ runner.temp }}/photo-organizer-appdata
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set AppData path
+        run: echo "PHOTO_ORGANIZER_APP_DATA=${{ runner.temp }}/photo-organizer-appdata" >> "$GITHUB_ENV"
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
